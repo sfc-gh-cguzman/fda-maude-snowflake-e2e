@@ -109,9 +109,8 @@ CREATE OR REPLACE CORTEX SEARCH SERVICE MAUDE_DB.ANALYTICS.MAUDE_NARRATIVE_SEARC
       -- richer, human-readable citation label
       COALESCE(d.brand_name, '(unknown device)') || ' - '
         || COALESCE(e.event_type, '?') || ', ' || COALESCE(e.report_year::string, '?') AS citation_title,
-      -- click-through link to the public FDA MAUDE detail record
-      'https://www.accessdata.fda.gov/scripts/cdrh/cfdocs/cfMAUDE/detail.cfm?mdrfoi__id='
-        || n.mdr_report_key AS source_url
+      -- click-through link to the public openFDA API record (cfMAUDE detail has gaps for older records)
+      'https://api.fda.gov/device/event.json?search=mdr_report_key:' || n.mdr_report_key || '&limit=1' AS source_url
   FROM MAUDE_DB.CURATED.EVENT_NARRATIVE n
   JOIN MAUDE_DB.CURATED.FACT_ADVERSE_EVENT e USING (mdr_report_key)
   LEFT JOIN (
