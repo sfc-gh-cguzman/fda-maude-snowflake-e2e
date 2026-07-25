@@ -31,7 +31,7 @@ FROM SPECIFICATION $$
   "models": { "orchestration": "auto" },
   "instructions": {
     "system": "You are a medical device postmarket safety analyst for clinicians. You answer questions about adverse events reported to the FDA MAUDE database. You have two tools: safety_analyst for counts, trends, and breakdowns; narrative_search for retrieving specific report narratives. Always use safety_analyst for any quantitative question. Always cite the mdr_report_key for narrative evidence.",
-    "response": "Be concise and clinical. Lead with the numbers, then supporting narrative examples. For each cited report, include: mdr_report_key, report_number, and the FDA source_url link so the user can verify the original MDR directly. ALWAYS end with this disclaimer: 'MAUDE is a passive surveillance system. Report counts cannot establish event rates, incidence, or causation, and this information must not be used for individual patient-care decisions.'",
+    "response": "Be concise and clinical. Lead with the numbers, then supporting narrative examples. Cite mdr_report_key and report_number for each referenced report. ALWAYS end with: 'MAUDE is a passive surveillance system. Report counts cannot establish event rates, incidence, or causation, and this information must not be used for individual patient-care decisions.'",
     "orchestration": "Use safety_analyst for any question involving how many, trends, comparisons, or breakdowns by device, manufacturer, product code, event type, or year. Use narrative_search when the clinician asks what happened, for examples, or to describe a failure mode.",
     "sample_questions": [
       { "question": "How many malfunction reports were filed for infusion pumps in the last 3 years?" },
@@ -53,8 +53,8 @@ FROM SPECIFICATION $$
     },
     "narrative_search": {
       "name": "MAUDE_DB.ANALYTICS.MAUDE_NARRATIVE_SEARCH",
-      "id_column": "mdr_report_key",
-      "title_column": "citation_title",
+      "id_column": "SOURCE_URL",
+      "title_column": "CITATION_TITLE",
       "max_results": 10,
       "execution_environment": { "type": "warehouse", "warehouse": "MAUDE_WH", "query_timeout": 299 }
     }
@@ -73,7 +73,7 @@ FROM SPECIFICATION $$
   "models": { "orchestration": "auto" },
   "instructions": {
     "system": "You help clinicians and safety officers find FDA MAUDE adverse-event reports describing specific device failure modes or clinical presentations. Retrieve the most relevant report narratives and summarize the common failure patterns.",
-    "response": "Summarize the failure patterns you find, then list the supporting reports with their mdr_report_key, report_number, event_type, and source_url (FDA deep link). If a narrative is marked redacted, note that trade-secret/patient text was removed by FDA. ALWAYS end with: 'MAUDE is a passive surveillance system. Report counts cannot establish event rates, incidence, or causation, and this information must not be used for individual patient-care decisions.'",
+    "response": "Summarize the failure patterns you find, then list supporting reports with mdr_report_key, report_number, and event_type. If a narrative is marked redacted, note that trade-secret/patient text was removed by FDA. ALWAYS end with: 'MAUDE is a passive surveillance system. Report counts cannot establish event rates, incidence, or causation, and this information must not be used for individual patient-care decisions.'",
     "orchestration": "Always call narrative_search first. Use the returned attributes (product_code, brand_name, event_type) to group and explain the findings.",
     "sample_questions": [
       { "question": "Find reports describing catheter tip fracture during retrieval." },
@@ -89,8 +89,8 @@ FROM SPECIFICATION $$
   "tool_resources": {
     "narrative_search": {
       "name": "MAUDE_DB.ANALYTICS.MAUDE_NARRATIVE_SEARCH",
-      "id_column": "mdr_report_key",
-      "title_column": "citation_title",
+      "id_column": "SOURCE_URL",
+      "title_column": "CITATION_TITLE",
       "max_results": 15,
       "execution_environment": { "type": "warehouse", "warehouse": "MAUDE_WH", "query_timeout": 299 }
     }
