@@ -36,6 +36,7 @@ FROM SPECIFICATION $$
     "sample_questions": [
       { "question": "How many malfunction reports were filed for infusion pumps in the last 3 years?" },
       { "question": "Compare death, injury, and malfunction report counts for coronary stents by year." },
+      { "question": "How many malfunction reports were filed for insulin pumps last year, and what failure modes do the narratives most often describe?" },
       { "question": "Which manufacturers have the most adverse-event reports for surgical staplers?" },
       { "question": "What are the most common product problems reported for insulin pumps, and what patient outcomes were noted?" },
       { "question": "Show the trend of reports for a given product code over time." }
