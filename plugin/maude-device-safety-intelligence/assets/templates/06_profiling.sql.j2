@@ -1,0 +1,103 @@
+-- =====================================================================
+-- MAUDE Ingestion - 06_profiling.sql
+-- Data profiling queries + Data Metric Functions (DMFs) for ongoing
+-- quality monitoring. Run as {{ engineer_role }} (DMF attach may need
+-- EXECUTE DATA METRIC FUNCTION granted by ACCOUNTADMIN - see bottom).
+-- =====================================================================
+
+USE ROLE {{ engineer_role }};
+USE WAREHOUSE {{ warehouse }};
+USE DATABASE {{ db() }};
+USE SCHEMA CURATED;
+
+-- 1. Volume + growth by report year -----------------------------------
+SELECT report_year, COUNT(*) AS mdr_count
+FROM FACT_ADVERSE_EVENT
+GROUP BY report_year ORDER BY report_year;
+
+-- 2. Event type distribution ------------------------------------------
+SELECT COALESCE(NULLIF(event_type,''),'(blank)') AS event_type,
+       COUNT(*) AS n,
+       ROUND(100 * COUNT(*) / SUM(COUNT(*)) OVER (), 2) AS pct
+FROM FACT_ADVERSE_EVENT GROUP BY 1 ORDER BY n DESC;
+
+-- 3. Completeness: null / blank rate on key fields --------------------
+SELECT
+    COUNT(*) AS total,
+    ROUND(100*COUNT_IF(event_type IS NULL OR event_type='')/COUNT(*),2)      AS pct_null_event_type,
+    ROUND(100*COUNT_IF(date_received IS NULL)/COUNT(*),2)                     AS pct_null_date_received,
+    ROUND(100*COUNT_IF(manufacturer_name IS NULL)/COUNT(*),2)                AS pct_null_manufacturer
+FROM FACT_ADVERSE_EVENT;
+
+-- 4. Cardinality ------------------------------------------------------
+SELECT
+    (SELECT COUNT(DISTINCT product_code) FROM DIM_DEVICE)      AS distinct_product_codes,
+    (SELECT COUNT(DISTINCT brand_name)   FROM DIM_DEVICE)      AS distinct_brands,
+    (SELECT COUNT(DISTINCT device_manufacturer_name) FROM DIM_DEVICE) AS distinct_device_mfrs,
+    (SELECT COUNT(DISTINCT medical_specialty) FROM DIM_DEVICE) AS distinct_specialties;
+
+-- 5. Top medical specialties by report volume -------------------------
+SELECT d.medical_specialty, COUNT(*) AS mdr_count
+FROM DIM_DEVICE d
+WHERE d.medical_specialty IS NOT NULL
+GROUP BY 1 ORDER BY mdr_count DESC LIMIT 20;
+
+-- 6. Narrative coverage, length, and FOIA redaction rate --------------
+SELECT
+    text_type_code,
+    COUNT(*) AS segments,
+    ROUND(AVG(narrative_length)) AS avg_len,
+    MEDIAN(narrative_length) AS median_len,
+    ROUND(100*COUNT_IF(redaction_flag)/COUNT(*),2) AS pct_redacted
+FROM EVENT_NARRATIVE GROUP BY 1 ORDER BY segments DESC;
+
+-- 7. Reporting lag (event -> FDA receipt) -----------------------------
+SELECT
+    MIN(date_received) AS earliest_report,
+    MAX(date_received) AS latest_report,
+    ROUND(AVG(reporting_lag_days)) AS avg_lag_days,
+    MEDIAN(reporting_lag_days) AS median_lag_days
+FROM FACT_ADVERSE_EVENT
+WHERE reporting_lag_days BETWEEN 0 AND 36500;
+
+-- 8. Grain integrity: duplicate mdr_report_key (expect 0) -------------
+SELECT COUNT(*) AS duplicate_keys
+FROM (SELECT mdr_report_key FROM FACT_ADVERSE_EVENT GROUP BY 1 HAVING COUNT(*) > 1);
+
+-- 9. Load reconciliation: RAW vs manifest -----------------------------
+SELECT
+    (SELECT COUNT(*) FROM {{ db() }}.RAW.RAW_DEVICE_EVENT)         AS raw_rows,
+    (SELECT SUM(loaded_records) FROM {{ db() }}.RAW.LOAD_CONTROL WHERE status='LOADED') AS control_loaded,
+    (SELECT COUNT(*) FROM {{ db() }}.RAW.LOAD_CONTROL WHERE status='LOADED') AS partitions_loaded,
+    (SELECT COUNT(*) FROM {{ db() }}.RAW.LOAD_CONTROL WHERE status='FAILED') AS partitions_failed;
+
+-- =====================================================================
+-- Data Metric Functions (DMFs) for ongoing monitoring
+-- =====================================================================
+-- Schedule metrics to evaluate daily.
+ALTER TABLE FACT_ADVERSE_EVENT SET DATA_METRIC_SCHEDULE = 'USING CRON 0 7 * * * America/Los_Angeles';
+
+-- Row count trend
+ALTER TABLE FACT_ADVERSE_EVENT
+  ADD DATA METRIC FUNCTION SNOWFLAKE.CORE.ROW_COUNT ON ();
+-- Uniqueness of the grain key
+ALTER TABLE FACT_ADVERSE_EVENT
+  ADD DATA METRIC FUNCTION SNOWFLAKE.CORE.DUPLICATE_COUNT ON (mdr_report_key);
+-- Completeness of critical fields
+ALTER TABLE FACT_ADVERSE_EVENT
+  ADD DATA METRIC FUNCTION SNOWFLAKE.CORE.NULL_COUNT ON (event_type);
+ALTER TABLE FACT_ADVERSE_EVENT
+  ADD DATA METRIC FUNCTION SNOWFLAKE.CORE.NULL_COUNT ON (date_received);
+
+-- Inspect recent DMF results:
+--   SELECT * FROM TABLE(INFORMATION_SCHEMA.DATA_METRIC_FUNCTION_REFERENCES(
+--       REF_ENTITY_NAME => '{{ db() }}.CURATED.FACT_ADVERSE_EVENT',
+--       REF_ENTITY_DOMAIN => 'TABLE'));
+--   SELECT * FROM SNOWFLAKE.LOCAL.DATA_QUALITY_MONITORING_RESULTS
+--    WHERE table_name = 'FACT_ADVERSE_EVENT' ORDER BY measurement_time DESC;
+
+-- =====================================================================
+-- If DMF attach fails with a privilege error, run once as ACCOUNTADMIN:
+--   GRANT EXECUTE DATA METRIC FUNCTION ON ACCOUNT TO ROLE {{ engineer_role }};
+--   GRANT DATABASE ROLE SNOWFLAKE.DATA_METRIC_USER TO ROLE {{ engineer_role }};
+-- =====================================================================

@@ -1,0 +1,11 @@
+{
+  "target_database": "MAUDE_DB",
+  "warehouse": "MAUDE_WH",
+  "engineer_role": "MAUDE_ENGINEER",
+  "clinician_role": "MAUDE_CLINICIAN",
+  "eai_name": "MAUDE_OPENFDA_EAI",
+  "target_lag": "1 day",
+  "load_scope": "full",
+  "enrichment_sample_rows": 200,
+  "enrichment_min_corpus_rows": 100000
+}

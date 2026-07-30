@@ -103,7 +103,7 @@ Incremental refresh, `TARGET_LAG='24 hours'`, grain reconstructed from the VARIA
 - **`FACT_ADVERSE_EVENT`** (grain = `mdr_report_key`): event_type, date_received, date_of_event, report_source_code, reporter_occupation, adverse_event_flag, product_problem_flag.
 - **`DIM_DEVICE`** (flatten `device[]`): brand_name, generic_name, manufacturer_d_name, model, product_code, `openfda.device_class`, `openfda.medical_specialty_description`, `openfda.regulation_number`.
 - **`V_DEVICE_PRIMARY`** (view over DIM_DEVICE): one row per MDR (lowest device_sequence_number). Feeds the semantic view so metrics can be sliced by brand/product_code/manufacturer without fanout.
-- **`EVENT_NARRATIVE`** (flatten `mdr_text[]`): mdr_report_key, text_type_code, `text` (clinical narrative) + `redaction_flag` derived from `(b)(4)`/`(b)(6)` presence.
+- **`EVENT_NARRATIVE`** (flatten `mdr_text[]`): mdr_report_key, **`mdr_text_key`** (FDA-assigned unique key per narrative segment), text_type_code, `text` (clinical narrative) + `redaction_flag` derived from `(b)(4)`/`(b)(6)` presence. Note the grain: an MDR carries many segments, so `mdr_report_key` is **not** unique here and neither is `(mdr_report_key, text_type_code)`.
 - **`PATIENT_OUTCOME`** (flatten `patient[]`) and **`BRIDGE_DEVICE_PROBLEM`** (problem codes).
 - **`V_PATIENT_PRIMARY`** (view over PATIENT_OUTCOME): one row per MDR (normalizes blank patient_sex to 'Unknown'). Feeds the semantic view.
 
@@ -123,8 +123,8 @@ Attach DMFs (freshness, row_count, null_count, unique) on `FACT_ADVERSE_EVENT` f
 
 ### Step 7 - ANALYTICS (Gold) layer
 - **Semantic view** (`MAUDE_SAFETY_SV`) over the star schema using the MDR-grain views: events (CHILD) references devices/patients (PARENTS) so event metrics can be sliced by brand/product_code/manufacturer/specialty without fanout. Problems stays as a child of events with its own `affected_report_count` metric.
-- **Cortex Search service** (`MAUDE_NARRATIVE_SEARCH`) over narratives (attributes: mdr_report_key, report_number, product_code, brand_name, event_type, citation_title, source_url). Citations link to the openFDA API record (`api.fda.gov/device/event.json?search=mdr_report_key:<key>`). TARGET_LAG 1 day.
-- **AI enrichment** (cost-bounded): `AI_CLASSIFY` for failure-mode / severity taxonomy. Gate with Cortex Code cost controls.
+- **Cortex Search service** (`MAUDE_NARRATIVE_SEARCH`) over narratives (attributes: `mdr_text_key`, mdr_report_key, report_number, product_code, brand_name, event_type, citation_title, source_url). Citations are keyed on **`mdr_text_key`** — the corpus is narrative-segment grain, so keying on `mdr_report_key` (or the derived `source_url`, which is a pure function of it) collapses ~54% of rows into duplicate ids and mis-attributes results. `source_url` remains an attribute for click-through to the openFDA API record (`api.fda.gov/device/event.json?search=mdr_report_key:<key>`), just not as the id. TARGET_LAG 1 day.
+- **AI enrichment** (cost-bounded): `AI_CLASSIFY` for failure-mode / severity taxonomy, at narrative-segment grain (`mdr_text_key`). Table DDL is created in `04_analytics.sql` but **populated separately in `08_enrichment.sql` after the backfill completes** — `04_analytics.sql` runs while lanes are still loading, so sampling there would classify a near-empty corpus. `08_enrichment.sql` self-guards on a minimum corpus size. Gate with Cortex Code cost controls.
 
 ### Step 8 - Clinician Cortex Agents
 Frame = device safety intelligence, not patient care. Build the top 2 first, then optionally 3-4.
@@ -134,7 +134,7 @@ Frame = device safety intelligence, not patient care. Build the top 2 first, the
 3. **Comparative Device Risk Agent** (optional): compare event-type/problem-code distribution across devices sharing a product_code (procurement/formulary).
 4. **Emerging Signal / Trend Agent** (optional): time-series spike detection by product_code/problem_code for safety officers and clinical engineering.
 
-As-built, both agents ship with starter `sample_questions` and pin `MAUDE_WH` via each tool's `execution_environment`. Citations use `citation_title` (composite: "brand - event_type, year"), include `report_number` and a clickable `source_url` (FDA MAUDE detail page deep link keyed on `mdr_report_key`). Response instructions tell the agent to surface these in every cited report. Every agent's response template must include the FDA disclaimer (MAUDE cannot establish rates/causation; not for individual care decisions) and cite MDR keys. RBAC: `MAUDE_CLINICIAN` gets read-only on ANALYTICS + agent usage only.
+As-built, both agents ship with starter `sample_questions` and pin `MAUDE_WH` via each tool's `execution_environment`. Citations are keyed on `mdr_text_key` (unique per narrative segment), use `citation_title` (composite: "brand - event_type, year") as the display label, and carry `report_number` plus a clickable `source_url` (openFDA API record keyed on `mdr_report_key`). Response instructions tell the agent to surface these in every cited report. Every agent's response template must include the FDA disclaimer (MAUDE cannot establish rates/causation; not for individual care decisions) and cite MDR keys. RBAC: `MAUDE_CLINICIAN` gets read-only on ANALYTICS + agent usage only.
 
 ---
 
@@ -186,20 +186,26 @@ heavy years by quarter.
 
 ## 7. Files (as-built) and runbook
 
-Run in order as `MAUDE_ENGINEER` (00 needs ACCOUNTADMIN for the EAI / task grants):
+Run in order as `MAUDE_ENGINEER` (00 needs ACCOUNTADMIN for the EAI / task grants).
+
+These are Jinja templates. Render them first with `assets/renderer/render.py`
+(see `skills/maude-deploy/SKILL.md`), then execute the emitted `.sql` in this
+order — which is `assets/build_manifest.yaml` `depends_on` order:
 
 | File | Purpose |
 |---|---|
-| `sql/00_setup.sql` | DB/schemas/warehouse, roles, EAI + network rule, task-exec grants |
-| `sql/01_raw.sql` | stage, JSON file format, `RAW_DEVICE_EVENT`, `LOAD_CONTROL`, `MANIFEST_HISTORY` |
-| `sql/02_ingest.sql` | `SP_MAUDE_INGEST` (backfill+sync), `TASK_MAUDE_WEEKLY_SYNC`, `TASK_MAUDE_BACKFILL` |
-| `sql/03_curated.sql` | star schema Dynamic Tables (fact/dims/narrative/patient/problem bridge) |
-| `sql/04_analytics.sql` | `V_NARRATIVE_ENRICHED`, semantic view `MAUDE_SAFETY_SV`, Cortex Search `MAUDE_NARRATIVE_SEARCH`, `AI_EVENT_ENRICHMENT`, clinician grants |
-| `sql/05_agents.sql` | `MAUDE_DEVICE_SAFETY_AGENT` + `MAUDE_FAILURE_MODE_AGENT` + grants |
-| `sql/06_profiling.sql` | profiling queries + DMFs |
-| `sql/07_backfill_fanout.sql` | parallel 18-lane backfill launcher + teardown |
-| `notebooks/01_maude_profiling.ipynb` | Snowsight profiling notebook (SQL cells: backfill status, volume, quality, narratives, redaction) |
-| `diagrams/pipeline_architecture.excalidraw` | architecture diagram |
+| `assets/templates/00_setup.sql.j2` | DB/schemas/warehouse, roles, EAI + network rule, task-exec grants |
+| `assets/templates/01_raw.sql.j2` | stage, JSON file format, `RAW_DEVICE_EVENT`, `LOAD_CONTROL`, `MANIFEST_HISTORY` |
+| `assets/templates/02_ingest.sql.j2` | `SP_MAUDE_INGEST` (backfill+sync), `TASK_MAUDE_WEEKLY_SYNC`, `TASK_MAUDE_BACKFILL` |
+| `assets/templates/03_curated.sql.j2` | star schema Dynamic Tables (fact/dims/narrative/patient/problem bridge) |
+| `assets/templates/04_analytics.sql.j2` | `V_NARRATIVE_ENRICHED`, semantic view `MAUDE_SAFETY_SV`, Cortex Search `MAUDE_NARRATIVE_SEARCH`, `AI_EVENT_ENRICHMENT` DDL, clinician grants |
+| `assets/templates/08_enrichment.sql.j2` | Populates `AI_EVENT_ENRICHMENT` with a bounded `AI_CLASSIFY` sample. **Must run after the backfill completes** — guarded on minimum corpus size |
+| `assets/templates/05_agents.sql.j2` | `MAUDE_DEVICE_SAFETY_AGENT` + `MAUDE_FAILURE_MODE_AGENT` + grants |
+| `assets/templates/06_profiling.sql.j2` | profiling queries + DMFs |
+| `assets/templates/07_backfill_fanout.sql.j2` | parallel backfill launcher (lane count set by `load_scope`) + teardown |
+
+Not shipped in this plugin (they live in the source repo): a Snowflake Workspace
+profiling notebook and the pipeline architecture diagram.
 
 The notebook is deployed as Snowsight notebook `MAUDE_DB.ANALYTICS.MAUDE_PROFILING`
 (staged in `@MAUDE_DB.ANALYTICS.NOTEBOOKS`, warehouse `MAUDE_WH`). Redeploy after

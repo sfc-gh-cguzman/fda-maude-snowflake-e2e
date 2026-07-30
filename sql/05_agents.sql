@@ -54,7 +54,7 @@ FROM SPECIFICATION $$
     },
     "narrative_search": {
       "name": "MAUDE_DB.ANALYTICS.MAUDE_NARRATIVE_SEARCH",
-      "id_column": "SOURCE_URL",
+      "id_column": "MDR_TEXT_KEY",
       "title_column": "CITATION_TITLE",
       "max_results": 10,
       "execution_environment": { "type": "warehouse", "warehouse": "MAUDE_WH", "query_timeout": 299 }
@@ -90,7 +90,7 @@ FROM SPECIFICATION $$
   "tool_resources": {
     "narrative_search": {
       "name": "MAUDE_DB.ANALYTICS.MAUDE_NARRATIVE_SEARCH",
-      "id_column": "SOURCE_URL",
+      "id_column": "MDR_TEXT_KEY",
       "title_column": "CITATION_TITLE",
       "max_results": 15,
       "execution_environment": { "type": "warehouse", "warehouse": "MAUDE_WH", "query_timeout": 299 }

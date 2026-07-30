@@ -2,7 +2,7 @@
 -- MAUDE Ingestion - 07_backfill_fanout.sql
 -- Parallel backfill via disjoint task lanes (bucketed by time period).
 --
--- Rendered from 07_backfill_fanout.sql.j2 with load_scope = full
+-- Rendered from 07_backfill_fanout.sql.j2 with load_scope = {{ load_scope }}
 --
 -- Rationale: SP_MAUDE_INGEST is single-node Python (HTTP download +
 -- ijson parse), so a larger warehouse does NOT speed a single lane.
@@ -18,7 +18,7 @@
 -- stay grouped. If you hit serverless-task concurrency limits, coarsen
 -- the recent-year buckets back toward year-level (e.g. '2019q%').
 --
--- Run as MAUDE_ENGINEER (needs EXECUTE MANAGED TASK - see 00_setup.sql).
+-- Run as {{ engineer_role }} (needs EXECUTE MANAGED TASK - see 00_setup.sql).
 --
 -- WARNING - buckets MUST stay disjoint. Each lane does
 -- DELETE WHERE _partition -> COPY FORCE, which is NOT atomic across lanes.
@@ -31,26 +31,41 @@
 -- then re-run. Verify with the per-partition reconciliation query below.
 -- =====================================================================
 
-USE ROLE MAUDE_ENGINEER;
-USE WAREHOUSE MAUDE_WH;
-USE DATABASE MAUDE_DB;
+USE ROLE {{ engineer_role }};
+USE WAREHOUSE {{ warehouse }};
+USE DATABASE {{ db() }};
 USE SCHEMA RAW;
 
 -- Launch all lanes: creates one XSMALL serverless task per bucket and
 -- fires it immediately. QUARTER_LIKE accepts a regex (alternation).
 DECLARE
   buckets ARRAY := ARRAY_CONSTRUCT(
+{%- if load_scope == 'full' %}
     -- FULL HISTORY (1993-2026): older/lighter years grouped
     '(1991|1992|1993|1994|1995|1996|1997|1998|1999|2000|2001|2002|2003|2004)q%',
     '(2005|2006|2007|2008)q%',
     '(2009|2010)q%',
     '(2011|2012)q%',
     '2013q%', '2014q%', '2015q%', '2016q%', '2017q%', '2018q%',
+{%- elif load_scope == 'last_10_years' %}
+    -- LAST 10 YEARS (2016+)
+    '(2016|2017|2018)q%',
+{%- elif load_scope == 'last_5_years' %}
+    -- LAST 5 YEARS (2021+)
+{%- endif %}
+{%- if load_scope in ['full', 'last_10_years'] %}
     -- heavy recent years: split PER QUARTER to flatten the tail
     '2019q1%', '2019q2%', '2019q3%', '2019q4%',
     '2020q1%', '2020q2%', '2020q3%', '2020q4%',
     '2021q1%', '2021q2%', '2021q3%', '2021q4%',
     '2022q1%', '2022q2%', '2022q3%', '2022q4%',
+{%- else %}
+    -- 2021-2022 are heavy (~56 partitions combined), so split PER QUARTER
+    -- here too. Grouping them into one '(2021|2022)q%' lane made that single
+    -- lane the tail: 56 partitions serially vs ~7 for every other lane.
+    '2021q1%', '2021q2%', '2021q3%', '2021q4%',
+    '2022q1%', '2022q2%', '2022q3%', '2022q4%',
+{%- endif %}
     '2023q1%', '2023q2%', '2023q3%', '2023q4%',
     '2024q1%', '2024q2%', '2024q3%', '2024q4%',
     '2025q1%', '2025q2%', '2025q3%', '2025q4%',
@@ -63,19 +78,19 @@ BEGIN
   FOR i IN 0 TO ARRAY_SIZE(buckets) - 1 DO
     b := buckets[i]::string;
     EXECUTE IMMEDIATE
-      'CREATE OR REPLACE TASK MAUDE_DB.RAW.TASK_MAUDE_BF_' || i ||
+      'CREATE OR REPLACE TASK {{ db() }}.RAW.TASK_MAUDE_BF_' || i ||
       ' USER_TASK_MANAGED_INITIAL_WAREHOUSE_SIZE = ''XSMALL''' ||
       ' USER_TASK_TIMEOUT_MS = 86400000' ||
       ' SUSPEND_TASK_AFTER_NUM_FAILURES = 0' ||
-      ' AS CALL MAUDE_DB.RAW.SP_MAUDE_INGEST(''BACKFILL'', 0, ''' || b || ''')';
-    EXECUTE IMMEDIATE 'EXECUTE TASK MAUDE_DB.RAW.TASK_MAUDE_BF_' || i;
+      ' AS CALL {{ db() }}.RAW.SP_MAUDE_INGEST(''BACKFILL'', 0, ''' || b || ''')';
+    EXECUTE IMMEDIATE 'EXECUTE TASK {{ db() }}.RAW.TASK_MAUDE_BF_' || i;
   END FOR;
-  RETURN 'launched ' || ARRAY_SIZE(buckets) || ' backfill lanes (scope: full)';
+  RETURN 'launched ' || ARRAY_SIZE(buckets) || ' backfill lanes (scope: {{ load_scope }})';
 END;
 
 -- Monitor:
 --   SELECT status, COUNT(*) partitions, SUM(loaded_records) rows_loaded
---   FROM MAUDE_DB.RAW.LOAD_CONTROL GROUP BY status;
+--   FROM {{ db() }}.RAW.LOAD_CONTROL GROUP BY status;
 --   SELECT name, state FROM TABLE(INFORMATION_SCHEMA.TASK_HISTORY())
 --    WHERE name ILIKE 'TASK_MAUDE_BF_%' ORDER BY scheduled_time DESC;
 --
@@ -83,9 +98,9 @@ END;
 -- where the ledger disagrees with what actually landed:
 --   WITH actual AS (
 --     SELECT _partition AS partition, COUNT(*) AS raw_rows
---     FROM MAUDE_DB.RAW.RAW_DEVICE_EVENT GROUP BY 1)
+--     FROM {{ db() }}.RAW.RAW_DEVICE_EVENT GROUP BY 1)
 --   SELECT l.partition, l.loaded_records, COALESCE(a.raw_rows,0) AS raw_rows
---   FROM MAUDE_DB.RAW.LOAD_CONTROL l
+--   FROM {{ db() }}.RAW.LOAD_CONTROL l
 --   LEFT JOIN actual a ON a.partition = l.partition
 --   WHERE l.status='LOADED' AND l.loaded_records <> COALESCE(a.raw_rows,0);
 --   -- expect zero rows. To repair: UPDATE those partitions to status='PENDING'
@@ -93,10 +108,10 @@ END;
 --
 -- Also confirm the MDR grain is unique (RAW is 1 row per MDR):
 --   SELECT COUNT(*) - COUNT(DISTINCT report_key) AS dupes
---   FROM MAUDE_DB.RAW.RAW_DEVICE_EVENT;   -- expect 0
+--   FROM {{ db() }}.RAW.RAW_DEVICE_EVENT;   -- expect 0
 
 -- Teardown after backfill completes (drop the transient lanes).
 -- The loop upper bound must be >= number of buckets.
 --   DECLARE i INT; BEGIN FOR i IN 0 TO 50 DO
---     EXECUTE IMMEDIATE 'DROP TASK IF EXISTS MAUDE_DB.RAW.TASK_MAUDE_BF_'||i;
+--     EXECUTE IMMEDIATE 'DROP TASK IF EXISTS {{ db() }}.RAW.TASK_MAUDE_BF_'||i;
 --   END FOR; END;

@@ -63,7 +63,7 @@ Key data models (`CURATED`):
 - `FACT_ADVERSE_EVENT` - one row per MDR (`mdr_report_key`): event type, dates, reporting lag, source.
 - `DIM_DEVICE` - device brand/manufacturer/model/product code + openFDA classification (device class, medical specialty, regulation number).
 - `V_DEVICE_PRIMARY` - one row per MDR (primary device), feeds the semantic view for dimension slicing without fanout.
-- `EVENT_NARRATIVE` - free-text reporter + manufacturer narratives, with `redaction_flag`.
+- `EVENT_NARRATIVE` - free-text reporter + manufacturer narratives, with `redaction_flag` and `mdr_text_key` (FDA-assigned unique id per narrative segment; one MDR has many segments).
 - `PATIENT_OUTCOME` - patient sex/age/weight and coded outcomes.
 - `V_PATIENT_PRIMARY` - one row per MDR (normalizes blank patient_sex), feeds the semantic view.
 - `BRIDGE_DEVICE_PROBLEM` - product-problem codes per report.
@@ -85,16 +85,20 @@ Key data models (`CURATED`):
 
 ### Run order
 
+These are Jinja templates \u2014 render with `assets/renderer/render.py` first, then
+execute the emitted `.sql` in this order (see `skills/maude-deploy/SKILL.md`).
+
 | File | Purpose |
 |---|---|
-| `sql/00_setup.sql` | DB/schemas/warehouse, roles, External Access Integration, task grants |
-| `sql/01_raw.sql` | stage, JSON file format, RAW table + control tables |
-| `sql/02_ingest.sql` | `SP_MAUDE_INGEST`, weekly sync task, one-off backfill task |
-| `sql/03_curated.sql` | star schema Dynamic Tables |
-| `sql/04_analytics.sql` | semantic view, Cortex Search, AI enrichment, clinician grants |
-| `sql/05_agents.sql` | the two clinician Cortex Agents + grants |
-| `sql/06_profiling.sql` | profiling queries + Data Metric Functions |
-| `sql/07_backfill_fanout.sql` | parallel backfill launcher + teardown |
+| `assets/templates/00_setup.sql.j2` | DB/schemas/warehouse, roles, External Access Integration, task grants |
+| `assets/templates/01_raw.sql.j2` | stage, JSON file format, RAW table + control tables |
+| `assets/templates/02_ingest.sql.j2` | `SP_MAUDE_INGEST`, weekly sync task, one-off backfill task |
+| `assets/templates/03_curated.sql.j2` | star schema Dynamic Tables |
+| `assets/templates/04_analytics.sql.j2` | semantic view, Cortex Search, AI enrichment DDL, clinician grants |
+| `assets/templates/08_enrichment.sql.j2` | Populates `AI_EVENT_ENRICHMENT` (bounded `AI_CLASSIFY` sample) - run **after** the backfill |
+| `assets/templates/05_agents.sql.j2` | the two clinician Cortex Agents + grants |
+| `assets/templates/06_profiling.sql.j2` | profiling queries + Data Metric Functions |
+| `assets/templates/07_backfill_fanout.sql.j2` | parallel backfill launcher + teardown |
 
 Then: run backfill (single task or `07` fan-out), and once complete
 `ALTER TASK MAUDE_DB.RAW.TASK_MAUDE_WEEKLY_SYNC RESUME;` for ongoing weekly updates.
@@ -130,7 +134,7 @@ See [DESIGN.md](DESIGN.md) for the full design, tradeoffs, and measured timings.
 |---|---|---|
 | **Signal detection & trending** | Event-type / problem-code counts by product code over time | Semantic view, trend queries |
 | **Failure-mode discovery** | Semantic search over ~58M narratives, returns cited MDRs | Cortex Search + Failure-Mode agent |
-| **Complaint triage / classification** | `AI_CLASSIFY` narratives into failure-mode + severity buckets | `AI_EVENT_ENRICHMENT` |
+| **Complaint triage / classification** | `AI_CLASSIFY` narratives into failure-mode + severity buckets | `AI_EVENT_ENRICHMENT` (one row per narrative segment) |
 | **Predicate / competitive benchmarking** | Compare same-product-code devices on event mix (as counts) | Semantic view |
 | **Regulatory & CER evidence** | Historical adverse-event picture for a product code, with citations | Semantic view + Cortex Search |
 | **Risk management (ISO 14971)** | Quantify known harms/hazards by device type from real-world reports | Semantic view + narratives |
@@ -152,7 +156,8 @@ Each citation includes:
 - **`mdr_report_key`** - the FDA's canonical MDR identifier (join key across the whole schema).
 - **`report_number`** - the human-readable MDR number shown in the MAUDE web UI.
 - **`citation_title`** - composite label: `brand_name - event_type, year`.
-- **`source_url`** - clickable link to the openFDA API record for verification (`https://api.fda.gov/device/event.json?search=mdr_report_key:<key>&limit=1`). Uses the API instead of the cfMAUDE web page because the web detail page has coverage gaps for older records.
+- **`mdr_text_key`** - the citation **id**. FDA-assigned and unique per narrative segment. The search corpus is segment grain, so `mdr_report_key` is not unique in it (~54% of rows share one) and cannot serve as the id without collapsing or mis-attributing citations.
+- **`source_url`** - clickable link to the openFDA API record for verification (`https://api.fda.gov/device/event.json?search=mdr_report_key:<key>&limit=1`). Uses the API instead of the cfMAUDE web page because the web detail page has coverage gaps for older records. This is a display/verification attribute only, **not** the id - it is derived purely from `mdr_report_key` and inherits its non-uniqueness.
 
 ### Sample questions
 

@@ -29,10 +29,11 @@ procurement/value analysis committees at medical device companies.
 ## Citations
 
 Every response cites:
-- `mdr_report_key` — FDA canonical identifier
+- `mdr_text_key` — the citation **id**; FDA-assigned, unique per narrative segment
+- `mdr_report_key` — FDA canonical report identifier (not unique in the narrative corpus)
 - `report_number` — human-readable MDR number
-- `citation_title` — "brand_name - event_type, year"
-- `source_url` — clickable deep link to the FDA MAUDE detail page
+- `citation_title` — "brand_name - event_type, year" (display label)
+- `source_url` — clickable link to the openFDA API record for verification
 
 ## Governance
 

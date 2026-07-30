@@ -1,0 +1,82 @@
+version: 1
+# Build manifest for the MAUDE Device Safety Intelligence deployment.
+#
+# Each object binds a Jinja template to a deploy step. Rendered by
+# assets/renderer/render.py, then executed in depends_on order by the
+# maude-deploy skill.
+#
+# The source (openFDA device/event) is fixed, so templates only parameterize
+# the deployment container names: target database, warehouse, roles, EAI.
+#
+# object_type: setup | raw | procedure | dynamic_tables | analytics | agents | profiling | backfill | enrichment
+# requires:    privileges the executing role needs for this step
+
+objects:
+  - object_name: 00_setup
+    object_type: setup
+    template: 00_setup.sql.j2
+    description: Database, medallion schemas, warehouse, roles, External Access Integration, task grants
+    depends_on: []
+    requires: [ACCOUNTADMIN for EAI + EXECUTE MANAGED TASK + CORTEX_USER grants]
+
+  - object_name: 01_raw
+    object_type: raw
+    template: 01_raw.sql.j2
+    description: Internal stage, JSON file format, VARIANT landing table, load-control + manifest ledgers
+    depends_on: [00_setup]
+    requires: [engineer_role]
+
+  - object_name: 02_ingest
+    object_type: procedure
+    template: 02_ingest.sql.j2
+    description: SP_MAUDE_INGEST Snowpark proc (backfill + sync), weekly sync task, one-off backfill task
+    depends_on: [01_raw]
+    requires: [engineer_role, USAGE on EAI]
+
+  - object_name: 07_backfill_fanout
+    object_type: backfill
+    template: 07_backfill_fanout.sql.j2
+    description: Parallel backfill launcher - XSMALL serverless lanes bucketed by load_scope
+    depends_on: [02_ingest]
+    requires: [engineer_role, EXECUTE MANAGED TASK]
+    params:
+      note: Runs async. Proceed to 03_curated while lanes load.
+
+  - object_name: 03_curated
+    object_type: dynamic_tables
+    template: 03_curated.sql.j2
+    description: Silver star schema as Dynamic Tables (fact, device, narrative, patient, problem bridge)
+    depends_on: [02_ingest]
+    requires: [engineer_role]
+    params:
+      target_lag: "1 day"
+
+  - object_name: 04_analytics
+    object_type: analytics
+    template: 04_analytics.sql.j2
+    description: MDR-grain views, semantic view, Cortex Search service, AI enrichment DDL, clinician grants
+    depends_on: [03_curated]
+    requires: [engineer_role, CORTEX_USER]
+
+  - object_name: 05_agents
+    object_type: agents
+    template: 05_agents.sql.j2
+    description: Device Safety Profile + Failure-Mode Search Cortex Agents with citations
+    depends_on: [04_analytics]
+    requires: [engineer_role, CREATE AGENT, CORTEX_USER]
+
+  - object_name: 06_profiling
+    object_type: profiling
+    template: 06_profiling.sql.j2
+    description: Profiling queries + Data Metric Functions for ongoing quality monitoring
+    depends_on: [03_curated]
+    requires: [engineer_role, EXECUTE DATA METRIC FUNCTION]
+
+  - object_name: 08_enrichment
+    object_type: enrichment
+    template: 08_enrichment.sql.j2
+    description: Populates AI_EVENT_ENRICHMENT with a bounded AI_CLASSIFY sample - MUST run after the backfill completes
+    depends_on: [04_analytics, 07_backfill_fanout]
+    requires: [engineer_role, CORTEX_USER]
+    params:
+      note: Guarded - fails fast if EVENT_NARRATIVE is still below enrichment_min_corpus_rows.

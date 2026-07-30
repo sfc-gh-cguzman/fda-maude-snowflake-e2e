@@ -21,12 +21,12 @@
 --     with owner's rights.
 --   * Every partition outcome is recorded in LOAD_CONTROL.
 --
--- Run as MAUDE_ENGINEER. Idempotent (CREATE OR REPLACE).
+-- Run as {{ engineer_role }}. Idempotent (CREATE OR REPLACE).
 -- =====================================================================
 
-USE ROLE MAUDE_ENGINEER;
-USE WAREHOUSE MAUDE_WH;
-USE DATABASE MAUDE_DB;
+USE ROLE {{ engineer_role }};
+USE WAREHOUSE {{ warehouse }};
+USE DATABASE {{ db() }};
 USE SCHEMA RAW;
 
 CREATE OR REPLACE PROCEDURE SP_MAUDE_INGEST(
@@ -39,7 +39,7 @@ LANGUAGE PYTHON
 RUNTIME_VERSION = '3.11'
 PACKAGES = ('snowflake-snowpark-python', 'requests', 'ijson')
 HANDLER = 'run'
-EXTERNAL_ACCESS_INTEGRATIONS = (MAUDE_OPENFDA_EAI)
+EXTERNAL_ACCESS_INTEGRATIONS = ({{ eai_name }})
 COMMENT = 'openFDA device/event backfill + incremental sync (NDJSON stream load)'
 AS
 $$
@@ -81,7 +81,7 @@ def _download_and_stage(session, url, partition):
             with zf.open(inner) as jf, gzip.open(ndjson_path, "wt", encoding="utf-8") as out:
                 for obj in ijson.items(jf, "results.item"):
                     out.write(json.dumps(obj)); out.write("\n"); rec += 1
-        stage_dir = f"@MAUDE_DB.RAW.MAUDE_STAGE/{partition}"
+        stage_dir = f"@{{ db() }}.RAW.MAUDE_STAGE/{partition}"
         session.file.put(ndjson_path, stage_dir, auto_compress=False, overwrite=True)
         os.unlink(ndjson_path)
         return rec, os.path.basename(url)
@@ -90,10 +90,10 @@ def _download_and_stage(session, url, partition):
         except OSError: pass
 
 def _copy_partition(session, partition, export_date, src_file):
-    stage_dir = f"@MAUDE_DB.RAW.MAUDE_STAGE/{partition}"
-    session.sql("DELETE FROM MAUDE_DB.RAW.RAW_DEVICE_EVENT WHERE _partition = ?", params=[partition]).collect()
+    stage_dir = f"@{{ db() }}.RAW.MAUDE_STAGE/{partition}"
+    session.sql("DELETE FROM {{ db() }}.RAW.RAW_DEVICE_EVENT WHERE _partition = ?", params=[partition]).collect()
     copy_sql = f"""
-        COPY INTO MAUDE_DB.RAW.RAW_DEVICE_EVENT
+        COPY INTO {{ db() }}.RAW.RAW_DEVICE_EVENT
             (payload, report_key, _partition, _export_date, _src_file)
         FROM (
             SELECT $1,
@@ -103,20 +103,20 @@ def _copy_partition(session, partition, export_date, src_file):
                    '{src_file}'
             FROM {stage_dir}/{partition}.json.gz
         )
-        FILE_FORMAT = (FORMAT_NAME = MAUDE_DB.RAW.FF_JSON_MAUDE)
+        FILE_FORMAT = (FORMAT_NAME = {{ db() }}.RAW.FF_JSON_MAUDE)
         FORCE = TRUE
         ON_ERROR = ABORT_STATEMENT
     """
     session.sql(copy_sql).collect()
     n = session.sql(
-        "SELECT COUNT(*) AS c FROM MAUDE_DB.RAW.RAW_DEVICE_EVENT WHERE _partition = ?",
+        "SELECT COUNT(*) AS c FROM {{ db() }}.RAW.RAW_DEVICE_EVENT WHERE _partition = ?",
         params=[partition]).collect()[0]["C"]
     return n
 
 def _upsert_control(session, partition, url, man_recs, loaded, export_date, status, err):
     session.sql(
         """
-        MERGE INTO MAUDE_DB.RAW.LOAD_CONTROL t
+        MERGE INTO {{ db() }}.RAW.LOAD_CONTROL t
         USING (SELECT ? AS partition) s ON t.partition = s.partition
         WHEN MATCHED THEN UPDATE SET
             file_url = ?, manifest_records = ?, loaded_records = ?,
@@ -134,13 +134,13 @@ def run(session, MODE, MAX_PARTITIONS, QUARTER_LIKE):
     parts = ev["partitions"]
 
     session.sql(
-        """INSERT INTO MAUDE_DB.RAW.MANIFEST_HISTORY
+        """INSERT INTO {{ db() }}.RAW.MANIFEST_HISTORY
            (endpoint_export_dt, total_records, partition_count, raw_manifest)
            SELECT ?::date, ?, ?, PARSE_JSON(?)""",
         params=[endpoint_export, ev["total_records"], len(parts), json.dumps(ev)]).collect()
 
     ctrl = {r["PARTITION"]: r for r in session.sql(
-        "SELECT partition, export_date, manifest_records, status FROM MAUDE_DB.RAW.LOAD_CONTROL").collect()}
+        "SELECT partition, export_date, manifest_records, status FROM {{ db() }}.RAW.LOAD_CONTROL").collect()}
 
     work = []
     for p in parts:
@@ -188,7 +188,7 @@ CREATE OR REPLACE TASK TASK_MAUDE_WEEKLY_SYNC
   USER_TASK_MANAGED_INITIAL_WAREHOUSE_SIZE = 'MEDIUM'
   COMMENT = 'Weekly openFDA MAUDE incremental sync'
 AS
-  CALL MAUDE_DB.RAW.SP_MAUDE_INGEST('SYNC', 0, NULL);
+  CALL {{ db() }}.RAW.SP_MAUDE_INGEST('SYNC', 0, NULL);
 
 -- Resume once backfill is done:
 -- ALTER TASK TASK_MAUDE_WEEKLY_SYNC RESUME;
@@ -204,7 +204,7 @@ AS
 -- ~17.6 GB / 25.4M-row load runs unattended.
 --   EXECUTE TASK TASK_MAUDE_BACKFILL;
 --   -- monitor:
---   SELECT status, COUNT(*) FROM MAUDE_DB.RAW.LOAD_CONTROL GROUP BY status;
+--   SELECT status, COUNT(*) FROM {{ db() }}.RAW.LOAD_CONTROL GROUP BY status;
 -- ---------------------------------------------------------------------
 CREATE OR REPLACE TASK TASK_MAUDE_BACKFILL
   USER_TASK_MANAGED_INITIAL_WAREHOUSE_SIZE = 'MEDIUM'
@@ -212,4 +212,4 @@ CREATE OR REPLACE TASK TASK_MAUDE_BACKFILL
   SUSPEND_TASK_AFTER_NUM_FAILURES = 0
   COMMENT = 'One-off full historical backfill of openFDA MAUDE (run via EXECUTE TASK)'
 AS
-  CALL MAUDE_DB.RAW.SP_MAUDE_INGEST('BACKFILL', 0, NULL);
+  CALL {{ db() }}.RAW.SP_MAUDE_INGEST('BACKFILL', 0, NULL);

@@ -101,6 +101,11 @@ CREATE OR REPLACE DYNAMIC TABLE EVENT_NARRATIVE
 AS
 SELECT
     r.report_key                                       AS mdr_report_key,
+    -- FDA-assigned unique key for this narrative segment. Stable across
+    -- reloads/reindexes, so it is the citation id for Cortex Search.
+    -- Neither mdr_report_key nor (mdr_report_key, text_type_code) is unique
+    -- at this grain: an MDR can carry hundreds of narrative segments.
+    mt.value:mdr_text_key::string                      AS mdr_text_key,
     mt.value:text_type_code::string                    AS text_type_code,
     mt.value:text::string                              AS narrative_text,
     LENGTH(mt.value:text::string)                      AS narrative_length,

@@ -1,0 +1,94 @@
+-- =====================================================================
+-- 08_enrichment.sql - populate AI_EVENT_ENRICHMENT (POST-BACKFILL).
+--
+-- Runs LAST, after the fan-out backfill is verified complete and the
+-- CURATED Dynamic Tables have refreshed. Splitting this out of
+-- 04_analytics.sql is deliberate: that script executes while the backfill
+-- is still loading, so an AI_CLASSIFY sample taken there would read a
+-- near-empty EVENT_NARRATIVE and ship a dead table.
+--
+-- Cost note: AI_CLASSIFY is billed per token. This ships a bounded sample
+-- (200 narrative segments) so the pattern is
+-- demonstrable without an unbounded bill on a multi-million-row corpus.
+-- Scale it with the serverless task at the bottom, under a cost budget.
+--
+-- Grain: one row per narrative segment (mdr_text_key), matching
+-- EVENT_NARRATIVE. NOT one row per MDR.
+--
+-- Run as MAUDE_ENGINEER. Idempotent.
+-- =====================================================================
+
+USE ROLE MAUDE_ENGINEER;
+USE WAREHOUSE MAUDE_WH;
+USE DATABASE MAUDE_DB;
+USE SCHEMA ANALYTICS;
+
+-- ---------------------------------------------------------------------
+-- Guard: refuse to sample an unloaded corpus. If this fails, the backfill
+-- or the Dynamic Table refresh has not finished - wait and re-run.
+-- ---------------------------------------------------------------------
+EXECUTE IMMEDIATE $$
+DECLARE
+    n INTEGER;
+BEGIN
+    SELECT COUNT(*) INTO :n FROM MAUDE_DB.CURATED.EVENT_NARRATIVE;
+    IF (:n < 100000) THEN
+        RAISE STATEMENT_ERROR;
+    END IF;
+    RETURN 'EVENT_NARRATIVE ready: ' || :n || ' rows';
+END;
+$$;
+
+-- ---------------------------------------------------------------------
+-- Bounded AI_CLASSIFY sample. Deterministic pick (ORDER BY mdr_text_key)
+-- so re-runs are reproducible rather than drifting each execution.
+-- ---------------------------------------------------------------------
+INSERT OVERWRITE INTO AI_EVENT_ENRICHMENT
+       (mdr_text_key, mdr_report_key, failure_mode, severity_bucket)
+SELECT
+    mdr_text_key,
+    mdr_report_key,
+    AI_CLASSIFY(narrative_text,
+        ['Device Malfunction','Use Error','Material or Component Failure',
+         'Software or Connectivity','Packaging or Sterility','Patient Injury',
+         'No Clear Failure']):labels[0]::string          AS failure_mode,
+    AI_CLASSIFY(narrative_text,
+        ['Death','Serious Injury','Malfunction Only','Unclear']):labels[0]::string AS severity_bucket
+FROM (
+    SELECT mdr_text_key, mdr_report_key, narrative_text
+    FROM MAUDE_DB.ANALYTICS.V_NARRATIVE_ENRICHED
+    WHERE text_type_code = 'Description of Event or Problem'
+      AND narrative_length BETWEEN 40 AND 4000
+      AND mdr_text_key IS NOT NULL
+    ORDER BY mdr_text_key
+    LIMIT 200
+);
+
+-- ---------------------------------------------------------------------
+-- Verify: row count and grain uniqueness.
+-- ---------------------------------------------------------------------
+SELECT COUNT(*)                       AS enriched_rows,
+       COUNT(DISTINCT mdr_text_key)   AS distinct_segments,
+       COUNT(DISTINCT mdr_report_key) AS distinct_mdrs
+FROM AI_EVENT_ENRICHMENT;
+
+-- ---------------------------------------------------------------------
+-- Scale-up pattern (run under a serverless task with a cost budget).
+-- Chunked and resumable: each run classifies the next N unenriched
+-- segments, so cost per execution is bounded.
+--
+--   CREATE OR REPLACE TASK MAUDE_DB.ANALYTICS.TASK_MAUDE_ENRICH
+--     SCHEDULE = 'USING CRON 0 3 * * * America/Los_Angeles'
+--   AS
+--   INSERT INTO MAUDE_DB.ANALYTICS.AI_EVENT_ENRICHMENT
+--          (mdr_text_key, mdr_report_key, failure_mode, severity_bucket)
+--   SELECT v.mdr_text_key, v.mdr_report_key,
+--          AI_CLASSIFY(v.narrative_text, [...]):labels[0]::string,
+--          AI_CLASSIFY(v.narrative_text, [...]):labels[0]::string
+--   FROM MAUDE_DB.ANALYTICS.V_NARRATIVE_ENRICHED v
+--   LEFT JOIN MAUDE_DB.ANALYTICS.AI_EVENT_ENRICHMENT e
+--          ON e.mdr_text_key = v.mdr_text_key
+--   WHERE v.text_type_code = 'Description of Event or Problem'
+--     AND e.mdr_text_key IS NULL
+--   LIMIT 50000;
+-- ---------------------------------------------------------------------

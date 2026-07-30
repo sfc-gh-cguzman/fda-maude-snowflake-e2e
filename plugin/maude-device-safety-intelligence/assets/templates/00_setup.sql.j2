@@ -12,7 +12,7 @@
 -- ---------------------------------------------------------------------
 USE ROLE SYSADMIN;
 
-CREATE WAREHOUSE IF NOT EXISTS MAUDE_WH
+CREATE WAREHOUSE IF NOT EXISTS {{ warehouse }}
   WAREHOUSE_SIZE = 'MEDIUM'          -- sized for the ~17.6 GB historical backfill
   AUTO_SUSPEND = 60
   AUTO_RESUME = TRUE
@@ -22,46 +22,46 @@ CREATE WAREHOUSE IF NOT EXISTS MAUDE_WH
 -- ---------------------------------------------------------------------
 -- Database + medallion schemas
 -- ---------------------------------------------------------------------
-CREATE DATABASE IF NOT EXISTS MAUDE_DB
+CREATE DATABASE IF NOT EXISTS {{ db() }}
   COMMENT = 'FDA MAUDE device adverse event lakehouse';
 
-CREATE SCHEMA IF NOT EXISTS MAUDE_DB.RAW       COMMENT = 'Bronze: staged openFDA JSON landed as VARIANT';
-CREATE SCHEMA IF NOT EXISTS MAUDE_DB.CURATED   COMMENT = 'Silver: typed star schema (Dynamic Tables)';
-CREATE SCHEMA IF NOT EXISTS MAUDE_DB.ANALYTICS COMMENT = 'Gold: semantic view, Cortex Search, AI enrichment, agents';
+CREATE SCHEMA IF NOT EXISTS {{ db() }}.RAW       COMMENT = 'Bronze: staged openFDA JSON landed as VARIANT';
+CREATE SCHEMA IF NOT EXISTS {{ db() }}.CURATED   COMMENT = 'Silver: typed star schema (Dynamic Tables)';
+CREATE SCHEMA IF NOT EXISTS {{ db() }}.ANALYTICS COMMENT = 'Gold: semantic view, Cortex Search, AI enrichment, agents';
 
 -- ---------------------------------------------------------------------
 -- Roles
---   MAUDE_ENGINEER  - builds and loads the pipeline
---   MAUDE_CLINICIAN - read-only ANALYTICS + agent usage
+--   {{ engineer_role }}  - builds and loads the pipeline
+--   {{ clinician_role }} - read-only ANALYTICS + agent usage
 -- ---------------------------------------------------------------------
 USE ROLE SECURITYADMIN;
 
-CREATE ROLE IF NOT EXISTS MAUDE_ENGINEER;
-CREATE ROLE IF NOT EXISTS MAUDE_CLINICIAN;
+CREATE ROLE IF NOT EXISTS {{ engineer_role }};
+CREATE ROLE IF NOT EXISTS {{ clinician_role }};
 
-GRANT ROLE MAUDE_ENGINEER  TO ROLE SYSADMIN;
-GRANT ROLE MAUDE_CLINICIAN TO ROLE SYSADMIN;
+GRANT ROLE {{ engineer_role }}  TO ROLE SYSADMIN;
+GRANT ROLE {{ clinician_role }} TO ROLE SYSADMIN;
 
 -- Warehouse usage
-GRANT USAGE ON WAREHOUSE MAUDE_WH TO ROLE MAUDE_ENGINEER;
-GRANT USAGE ON WAREHOUSE MAUDE_WH TO ROLE MAUDE_CLINICIAN;
+GRANT USAGE ON WAREHOUSE {{ warehouse }} TO ROLE {{ engineer_role }};
+GRANT USAGE ON WAREHOUSE {{ warehouse }} TO ROLE {{ clinician_role }};
 
 -- Engineer: full control of the database
-GRANT USAGE ON DATABASE MAUDE_DB TO ROLE MAUDE_ENGINEER;
-GRANT USAGE ON ALL SCHEMAS IN DATABASE MAUDE_DB TO ROLE MAUDE_ENGINEER;
-GRANT ALL PRIVILEGES ON SCHEMA MAUDE_DB.RAW       TO ROLE MAUDE_ENGINEER;
-GRANT ALL PRIVILEGES ON SCHEMA MAUDE_DB.CURATED   TO ROLE MAUDE_ENGINEER;
-GRANT ALL PRIVILEGES ON SCHEMA MAUDE_DB.ANALYTICS TO ROLE MAUDE_ENGINEER;
+GRANT USAGE ON DATABASE {{ db() }} TO ROLE {{ engineer_role }};
+GRANT USAGE ON ALL SCHEMAS IN DATABASE {{ db() }} TO ROLE {{ engineer_role }};
+GRANT ALL PRIVILEGES ON SCHEMA {{ db() }}.RAW       TO ROLE {{ engineer_role }};
+GRANT ALL PRIVILEGES ON SCHEMA {{ db() }}.CURATED   TO ROLE {{ engineer_role }};
+GRANT ALL PRIVILEGES ON SCHEMA {{ db() }}.ANALYTICS TO ROLE {{ engineer_role }};
 
 -- Clinician grants are applied AFTER the ownership transfer below, because
 -- GRANT OWNERSHIP ... REVOKE CURRENT GRANTS would otherwise wipe them.
 
 -- Let the engineer role own future objects created here
 USE ROLE SYSADMIN;
-GRANT OWNERSHIP ON SCHEMA MAUDE_DB.RAW       TO ROLE MAUDE_ENGINEER REVOKE CURRENT GRANTS;
-GRANT OWNERSHIP ON SCHEMA MAUDE_DB.CURATED   TO ROLE MAUDE_ENGINEER REVOKE CURRENT GRANTS;
-GRANT OWNERSHIP ON SCHEMA MAUDE_DB.ANALYTICS TO ROLE MAUDE_ENGINEER REVOKE CURRENT GRANTS;
-GRANT OWNERSHIP ON DATABASE MAUDE_DB TO ROLE MAUDE_ENGINEER REVOKE CURRENT GRANTS;
+GRANT OWNERSHIP ON SCHEMA {{ db() }}.RAW       TO ROLE {{ engineer_role }} REVOKE CURRENT GRANTS;
+GRANT OWNERSHIP ON SCHEMA {{ db() }}.CURATED   TO ROLE {{ engineer_role }} REVOKE CURRENT GRANTS;
+GRANT OWNERSHIP ON SCHEMA {{ db() }}.ANALYTICS TO ROLE {{ engineer_role }} REVOKE CURRENT GRANTS;
+GRANT OWNERSHIP ON DATABASE {{ db() }} TO ROLE {{ engineer_role }} REVOKE CURRENT GRANTS;
 
 -- ---------------------------------------------------------------------
 -- Clinician: read-only on ANALYTICS only (no RAW / CURATED access).
@@ -69,14 +69,14 @@ GRANT OWNERSHIP ON DATABASE MAUDE_DB TO ROLE MAUDE_ENGINEER REVOKE CURRENT GRANT
 -- earlier would have the transfer's REVOKE CURRENT GRANTS silently drop it,
 -- leaving the clinician role unable to reach the database at all.
 -- ---------------------------------------------------------------------
-USE ROLE MAUDE_ENGINEER;
+USE ROLE {{ engineer_role }};
 
-GRANT USAGE ON DATABASE MAUDE_DB TO ROLE MAUDE_CLINICIAN;
-GRANT USAGE ON SCHEMA MAUDE_DB.ANALYTICS TO ROLE MAUDE_CLINICIAN;
-GRANT SELECT ON ALL TABLES    IN SCHEMA MAUDE_DB.ANALYTICS TO ROLE MAUDE_CLINICIAN;
-GRANT SELECT ON FUTURE TABLES IN SCHEMA MAUDE_DB.ANALYTICS TO ROLE MAUDE_CLINICIAN;
-GRANT SELECT ON ALL VIEWS     IN SCHEMA MAUDE_DB.ANALYTICS TO ROLE MAUDE_CLINICIAN;
-GRANT SELECT ON FUTURE VIEWS  IN SCHEMA MAUDE_DB.ANALYTICS TO ROLE MAUDE_CLINICIAN;
+GRANT USAGE ON DATABASE {{ db() }} TO ROLE {{ clinician_role }};
+GRANT USAGE ON SCHEMA {{ db() }}.ANALYTICS TO ROLE {{ clinician_role }};
+GRANT SELECT ON ALL TABLES    IN SCHEMA {{ db() }}.ANALYTICS TO ROLE {{ clinician_role }};
+GRANT SELECT ON FUTURE TABLES IN SCHEMA {{ db() }}.ANALYTICS TO ROLE {{ clinician_role }};
+GRANT SELECT ON ALL VIEWS     IN SCHEMA {{ db() }}.ANALYTICS TO ROLE {{ clinician_role }};
+GRANT SELECT ON FUTURE VIEWS  IN SCHEMA {{ db() }}.ANALYTICS TO ROLE {{ clinician_role }};
 
 -- ---------------------------------------------------------------------
 -- External Access Integration to openFDA
@@ -87,34 +87,34 @@ GRANT SELECT ON FUTURE VIEWS  IN SCHEMA MAUDE_DB.ANALYTICS TO ROLE MAUDE_CLINICI
 -- ---------------------------------------------------------------------
 USE ROLE ACCOUNTADMIN;
 
-CREATE OR REPLACE NETWORK RULE MAUDE_DB.RAW.OPENFDA_NETWORK_RULE
+CREATE OR REPLACE NETWORK RULE {{ db() }}.RAW.OPENFDA_NETWORK_RULE
   MODE = EGRESS
   TYPE = HOST_PORT
   VALUE_LIST = ('download.open.fda.gov', 'api.fda.gov')
   COMMENT = 'Egress to openFDA download + manifest hosts';
 
-CREATE OR REPLACE EXTERNAL ACCESS INTEGRATION MAUDE_OPENFDA_EAI
-  ALLOWED_NETWORK_RULES = (MAUDE_DB.RAW.OPENFDA_NETWORK_RULE)
+CREATE OR REPLACE EXTERNAL ACCESS INTEGRATION {{ eai_name }}
+  ALLOWED_NETWORK_RULES = ({{ db() }}.RAW.OPENFDA_NETWORK_RULE)
   ENABLED = TRUE
   COMMENT = 'External access for the MAUDE openFDA ingestion procs';
 
-GRANT USAGE ON INTEGRATION MAUDE_OPENFDA_EAI TO ROLE MAUDE_ENGINEER;
+GRANT USAGE ON INTEGRATION {{ eai_name }} TO ROLE {{ engineer_role }};
 
 -- Allow the engineer role to run serverless / managed tasks (backfill + sync)
-GRANT EXECUTE MANAGED TASK ON ACCOUNT TO ROLE MAUDE_ENGINEER;
-GRANT EXECUTE TASK         ON ACCOUNT TO ROLE MAUDE_ENGINEER;
+GRANT EXECUTE MANAGED TASK ON ACCOUNT TO ROLE {{ engineer_role }};
+GRANT EXECUTE TASK         ON ACCOUNT TO ROLE {{ engineer_role }};
 
 -- Cortex AI usage (required for Cortex Search, Analyst, AI functions, Agents).
 -- Must run before 04_analytics.sql: without it CREATE CORTEX SEARCH SERVICE
 -- fails with "Unknown function 'SNOWFLAKE.CORTEX.EMBED_TEXT_768'", because the
 -- service compiles an internal Dynamic Table that calls the embedding function.
-GRANT DATABASE ROLE SNOWFLAKE.CORTEX_USER TO ROLE MAUDE_ENGINEER;
-GRANT DATABASE ROLE SNOWFLAKE.CORTEX_USER TO ROLE MAUDE_CLINICIAN;
+GRANT DATABASE ROLE SNOWFLAKE.CORTEX_USER TO ROLE {{ engineer_role }};
+GRANT DATABASE ROLE SNOWFLAKE.CORTEX_USER TO ROLE {{ clinician_role }};
 
 -- ---------------------------------------------------------------------
 -- Context for the rest of the build
 -- ---------------------------------------------------------------------
-USE ROLE MAUDE_ENGINEER;
-USE WAREHOUSE MAUDE_WH;
-USE DATABASE MAUDE_DB;
+USE ROLE {{ engineer_role }};
+USE WAREHOUSE {{ warehouse }};
+USE DATABASE {{ db() }};
 USE SCHEMA RAW;

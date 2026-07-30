@@ -3,12 +3,12 @@
 -- Gold layer: semantic view (Cortex Analyst), Cortex Search service over
 -- narratives, and a cost-bounded AI enrichment table.
 --
--- Run as MAUDE_ENGINEER. Idempotent.
+-- Run as {{ engineer_role }}. Idempotent.
 -- =====================================================================
 
-USE ROLE MAUDE_ENGINEER;
-USE WAREHOUSE MAUDE_WH;
-USE DATABASE MAUDE_DB;
+USE ROLE {{ engineer_role }};
+USE WAREHOUSE {{ warehouse }};
+USE DATABASE {{ db() }};
 USE SCHEMA ANALYTICS;
 
 -- ---------------------------------------------------------------------
@@ -19,6 +19,7 @@ USE SCHEMA ANALYTICS;
 CREATE OR REPLACE VIEW V_NARRATIVE_ENRICHED AS
 SELECT
     n.mdr_report_key,
+    n.mdr_text_key,
     n.text_type_code,
     n.narrative_text,
     n.narrative_length,
@@ -33,13 +34,13 @@ SELECT
     d.product_code,
     d.device_class,
     d.medical_specialty
-FROM MAUDE_DB.CURATED.EVENT_NARRATIVE n
-JOIN MAUDE_DB.CURATED.FACT_ADVERSE_EVENT e USING (mdr_report_key)
+FROM {{ db() }}.CURATED.EVENT_NARRATIVE n
+JOIN {{ db() }}.CURATED.FACT_ADVERSE_EVENT e USING (mdr_report_key)
 LEFT JOIN (
     SELECT mdr_report_key, brand_name, generic_name, device_manufacturer_name,
            product_code, device_class, medical_specialty,
            ROW_NUMBER() OVER (PARTITION BY mdr_report_key ORDER BY device_sequence_number) AS rn
-    FROM MAUDE_DB.CURATED.DIM_DEVICE
+    FROM {{ db() }}.CURATED.DIM_DEVICE
     QUALIFY rn = 1
 ) d USING (mdr_report_key);
 
@@ -65,12 +66,12 @@ LEFT JOIN (
 -- Respironics CPAP units). Answer those with a direct query against
 -- CURATED.DIM_DEVICE, which retains every device row.
 -- ---------------------------------------------------------------------
-CREATE OR REPLACE VIEW MAUDE_DB.CURATED.V_DEVICE_PRIMARY
+CREATE OR REPLACE VIEW {{ db() }}.CURATED.V_DEVICE_PRIMARY
 COMMENT = 'Primary (lowest device_sequence_number) device per MDR - one row per report'
 AS
 SELECT mdr_report_key, brand_name, generic_name, device_manufacturer_name,
        product_code, device_class, medical_specialty
-FROM MAUDE_DB.CURATED.DIM_DEVICE
+FROM {{ db() }}.CURATED.DIM_DEVICE
 QUALIFY ROW_NUMBER() OVER (
           PARTITION BY mdr_report_key
           ORDER BY device_sequence_number, brand_name, product_code) = 1;
@@ -78,12 +79,12 @@ QUALIFY ROW_NUMBER() OVER (
 -- patient_sex arrives with three distinct spellings of "unknown" ('Unknown',
 -- empty string, NULL). Collapsing the empty string keeps Cortex Analyst from
 -- reporting 1.4M events under a blank label as if it were its own cohort.
-CREATE OR REPLACE VIEW MAUDE_DB.CURATED.V_PATIENT_PRIMARY
+CREATE OR REPLACE VIEW {{ db() }}.CURATED.V_PATIENT_PRIMARY
 COMMENT = 'One patient-outcome row per MDR; blank patient_sex normalized to Unknown'
 AS
 SELECT mdr_report_key,
        COALESCE(NULLIF(patient_sex, ''), 'Unknown') AS patient_sex
-FROM MAUDE_DB.CURATED.PATIENT_OUTCOME
+FROM {{ db() }}.CURATED.PATIENT_OUTCOME
 QUALIFY ROW_NUMBER() OVER (
           PARTITION BY mdr_report_key
           ORDER BY NULLIF(patient_sex, '') NULLS LAST) = 1;
@@ -98,15 +99,15 @@ QUALIFY ROW_NUMBER() OVER (
 -- many-to-one) and therefore carries its own COUNT(DISTINCT) metric
 -- instead of borrowing the event-grain ones.
 -- ---------------------------------------------------------------------
-CREATE OR REPLACE SEMANTIC VIEW MAUDE_DB.ANALYTICS.MAUDE_SAFETY_SV
+CREATE OR REPLACE SEMANTIC VIEW {{ db() }}.ANALYTICS.MAUDE_SAFETY_SV
   TABLES (
-    events   AS MAUDE_DB.CURATED.FACT_ADVERSE_EVENT PRIMARY KEY (mdr_report_key)
+    events   AS {{ db() }}.CURATED.FACT_ADVERSE_EVENT PRIMARY KEY (mdr_report_key)
              COMMENT = 'One row per FDA medical device report (MDR)',
-    devices  AS MAUDE_DB.CURATED.V_DEVICE_PRIMARY PRIMARY KEY (mdr_report_key)
+    devices  AS {{ db() }}.CURATED.V_DEVICE_PRIMARY PRIMARY KEY (mdr_report_key)
              COMMENT = 'Primary device named on each report (one row per MDR)',
-    patients AS MAUDE_DB.CURATED.V_PATIENT_PRIMARY PRIMARY KEY (mdr_report_key)
+    patients AS {{ db() }}.CURATED.V_PATIENT_PRIMARY PRIMARY KEY (mdr_report_key)
              COMMENT = 'Patient outcome per report (one row per MDR)',
-    problems AS MAUDE_DB.CURATED.BRIDGE_DEVICE_PROBLEM
+    problems AS {{ db() }}.CURATED.BRIDGE_DEVICE_PROBLEM
              COMMENT = 'Product problem descriptions per report (many per MDR)'
   )
   RELATIONSHIPS (
@@ -149,16 +150,21 @@ CREATE OR REPLACE SEMANTIC VIEW MAUDE_DB.ANALYTICS.MAUDE_SAFETY_SV
 -- the Dynamic Tables directly: a Cortex Search service cannot read from a
 -- view that references Dynamic Tables.
 -- ---------------------------------------------------------------------
-CREATE OR REPLACE CORTEX SEARCH SERVICE MAUDE_DB.ANALYTICS.MAUDE_NARRATIVE_SEARCH
+CREATE OR REPLACE CORTEX SEARCH SERVICE {{ db() }}.ANALYTICS.MAUDE_NARRATIVE_SEARCH
   ON narrative_text
-  ATTRIBUTES mdr_report_key, report_number, text_type_code, event_type, product_code,
+  ATTRIBUTES mdr_text_key, mdr_report_key, report_number, text_type_code, event_type, product_code,
              brand_name, medical_specialty, device_class, report_year, redaction_flag,
              citation_title, source_url
-  WAREHOUSE = MAUDE_WH
+  WAREHOUSE = {{ warehouse }}
   TARGET_LAG = '1 day'
   COMMENT = 'Semantic search over FDA MAUDE adverse-event narratives, cited by MDR key with FDA deep link'
   AS
   SELECT
+      -- Unique citation id. mdr_report_key is NOT unique at this grain (an MDR
+      -- carries many narrative segments), so using it would collapse or
+      -- mis-attribute citations. mdr_text_key is FDA-assigned per segment and
+      -- stable across reloads/reindexes.
+      n.mdr_text_key,
       n.mdr_report_key, n.narrative_text, n.text_type_code, n.redaction_flag,
       e.event_type, e.report_year, e.report_number,
       d.product_code, d.brand_name, d.medical_specialty, d.device_class,
@@ -167,54 +173,40 @@ CREATE OR REPLACE CORTEX SEARCH SERVICE MAUDE_DB.ANALYTICS.MAUDE_NARRATIVE_SEARC
         || COALESCE(e.event_type, '?') || ', ' || COALESCE(e.report_year::string, '?') AS citation_title,
       -- click-through link to the public openFDA API record (cfMAUDE detail has gaps for older records)
       'https://api.fda.gov/device/event.json?search=mdr_report_key:' || n.mdr_report_key || '&limit=1' AS source_url
-  FROM MAUDE_DB.CURATED.EVENT_NARRATIVE n
-  JOIN MAUDE_DB.CURATED.FACT_ADVERSE_EVENT e USING (mdr_report_key)
+  FROM {{ db() }}.CURATED.EVENT_NARRATIVE n
+  JOIN {{ db() }}.CURATED.FACT_ADVERSE_EVENT e USING (mdr_report_key)
   LEFT JOIN (
       SELECT mdr_report_key, brand_name, product_code, device_class, medical_specialty,
              ROW_NUMBER() OVER (PARTITION BY mdr_report_key ORDER BY device_sequence_number) AS rn
-      FROM MAUDE_DB.CURATED.DIM_DEVICE QUALIFY rn = 1
+      FROM {{ db() }}.CURATED.DIM_DEVICE QUALIFY rn = 1
   ) d USING (mdr_report_key)
   WHERE n.narrative_text IS NOT NULL AND n.narrative_length >= 20;
 
 -- ---------------------------------------------------------------------
--- AI enrichment (cost-bounded). Classifies the reporter narrative into a
--- clinical failure-mode + severity taxonomy. Materialized on a SAMPLE for
--- build validation; scale via the documented INSERT + serverless task,
--- gated by Cortex Code cost controls.
+-- AI enrichment target table (DDL only).
+--
+-- Deliberately NOT populated here. This script runs while the backfill is
+-- still loading, so any INSERT ... LIMIT n at this point would read a
+-- near-empty EVENT_NARRATIVE (the Dynamic Tables also carry TARGET_LAG,
+-- widening that window) and silently ship an empty table.
+-- Population happens in 08_enrichment.sql, after the backfill is verified.
+--
+-- Grain is one row per NARRATIVE SEGMENT (mdr_text_key), not per MDR: an
+-- MDR carries many segments, so an MDR-keyed table would not be unique.
 -- ---------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS AI_EVENT_ENRICHMENT (
-    mdr_report_key STRING,
-    failure_mode   STRING,
+    mdr_text_key    STRING,
+    mdr_report_key  STRING,
+    failure_mode    STRING,
     severity_bucket STRING,
-    enriched_at    TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+    enriched_at     TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
 )
-COMMENT = 'AI_CLASSIFY-derived failure mode + severity per MDR (cost-bounded)';
-
--- Build/validate on a bounded sample (safe to re-run for the demo).
-INSERT OVERWRITE INTO AI_EVENT_ENRICHMENT (mdr_report_key, failure_mode, severity_bucket)
-SELECT
-    mdr_report_key,
-    AI_CLASSIFY(narrative_text,
-        ['Device Malfunction','Use Error','Material or Component Failure',
-         'Software or Connectivity','Packaging or Sterility','Patient Injury',
-         'No Clear Failure']):labels[0]::string          AS failure_mode,
-    AI_CLASSIFY(narrative_text,
-        ['Death','Serious Injury','Malfunction Only','Unclear']):labels[0]::string AS severity_bucket
-FROM MAUDE_DB.ANALYTICS.V_NARRATIVE_ENRICHED
-WHERE text_type_code = 'Description of Event or Problem'
-  AND narrative_length BETWEEN 40 AND 4000
-LIMIT 200;
-
--- Scale-up pattern (run under a serverless task with a cost budget):
---   INSERT INTO AI_EVENT_ENRICHMENT ...
---   SELECT ... FROM V_NARRATIVE_ENRICHED v
---   WHERE v.text_type_code = 'Description of Event or Problem'
---     AND v.mdr_report_key NOT IN (SELECT mdr_report_key FROM AI_EVENT_ENRICHMENT);
+COMMENT = 'AI_CLASSIFY-derived failure mode + severity, one row per narrative segment (mdr_text_key). Populated by 08_enrichment.sql post-backfill; empty until then.';
 
 -- ---------------------------------------------------------------------
 -- Clinician read access to the gold objects.
 -- ---------------------------------------------------------------------
-GRANT SELECT ON VIEW  MAUDE_DB.ANALYTICS.V_NARRATIVE_ENRICHED TO ROLE MAUDE_CLINICIAN;
-GRANT SELECT ON TABLE MAUDE_DB.ANALYTICS.AI_EVENT_ENRICHMENT  TO ROLE MAUDE_CLINICIAN;
-GRANT USAGE  ON CORTEX SEARCH SERVICE MAUDE_DB.ANALYTICS.MAUDE_NARRATIVE_SEARCH TO ROLE MAUDE_CLINICIAN;
-GRANT SELECT ON SEMANTIC VIEW MAUDE_DB.ANALYTICS.MAUDE_SAFETY_SV TO ROLE MAUDE_CLINICIAN;
+GRANT SELECT ON VIEW  {{ db() }}.ANALYTICS.V_NARRATIVE_ENRICHED TO ROLE {{ clinician_role }};
+GRANT SELECT ON TABLE {{ db() }}.ANALYTICS.AI_EVENT_ENRICHMENT  TO ROLE {{ clinician_role }};
+GRANT USAGE  ON CORTEX SEARCH SERVICE {{ db() }}.ANALYTICS.MAUDE_NARRATIVE_SEARCH TO ROLE {{ clinician_role }};
+GRANT SELECT ON SEMANTIC VIEW {{ db() }}.ANALYTICS.MAUDE_SAFETY_SV TO ROLE {{ clinician_role }};

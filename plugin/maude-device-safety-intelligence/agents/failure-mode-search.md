@@ -29,7 +29,8 @@ clinical/medical affairs professionals looking for specific failure evidence.
 ## Citations
 
 Same citation model as the Device Safety Profile agent:
-`mdr_report_key`, `report_number`, `citation_title`, `source_url` (FDA deep link).
+`mdr_text_key` (the unique citation id), `mdr_report_key`, `report_number`,
+`citation_title`, `source_url` (openFDA API record for verification).
 
 ## Governance
 

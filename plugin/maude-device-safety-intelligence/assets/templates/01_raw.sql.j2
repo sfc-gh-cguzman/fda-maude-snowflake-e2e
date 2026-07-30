@@ -3,12 +3,12 @@
 -- Bronze layer: internal stage, raw VARIANT landing table, and the
 -- control tables that drive idempotent backfill + incremental sync.
 --
--- Run as MAUDE_ENGINEER. Idempotent.
+-- Run as {{ engineer_role }}. Idempotent.
 -- =====================================================================
 
-USE ROLE MAUDE_ENGINEER;
-USE WAREHOUSE MAUDE_WH;
-USE DATABASE MAUDE_DB;
+USE ROLE {{ engineer_role }};
+USE WAREHOUSE {{ warehouse }};
+USE DATABASE {{ db() }};
 USE SCHEMA RAW;
 
 -- ---------------------------------------------------------------------

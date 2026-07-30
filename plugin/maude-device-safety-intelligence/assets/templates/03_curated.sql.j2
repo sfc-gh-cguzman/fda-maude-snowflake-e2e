@@ -9,17 +9,17 @@
 --   PATIENT_OUTCOME        1 row per patient on a report
 --   BRIDGE_DEVICE_PROBLEM  1 row per (report, product problem)
 --
--- Refresh: TARGET_LAG '1 day', warehouse MAUDE_WH. FACT is a direct
+-- Refresh: TARGET_LAG '1 day', warehouse {{ warehouse }}. FACT is a direct
 -- projection (incremental-friendly). The FLATTEN-based children may
 -- full-refresh; acceptable given the weekly source cadence. openFDA
 -- dates are 'YYYYMMDD' strings -> TRY_TO_DATE.
 --
--- Run as MAUDE_ENGINEER. Idempotent.
+-- Run as {{ engineer_role }}. Idempotent.
 -- =====================================================================
 
-USE ROLE MAUDE_ENGINEER;
-USE WAREHOUSE MAUDE_WH;
-USE DATABASE MAUDE_DB;
+USE ROLE {{ engineer_role }};
+USE WAREHOUSE {{ warehouse }};
+USE DATABASE {{ db() }};
 USE SCHEMA CURATED;
 
 -- ---------------------------------------------------------------------
@@ -28,7 +28,7 @@ USE SCHEMA CURATED;
 -- ---------------------------------------------------------------------
 CREATE OR REPLACE DYNAMIC TABLE FACT_ADVERSE_EVENT
   TARGET_LAG = '1 day'
-  WAREHOUSE = MAUDE_WH
+  WAREHOUSE = {{ warehouse }}
   REFRESH_MODE = AUTO
   INITIALIZE = ON_CREATE
   COMMENT = 'Master MDR event grain'
@@ -55,14 +55,14 @@ SELECT
     YEAR(TRY_TO_DATE(payload:date_received::string, 'YYYYMMDD'))   AS report_year,
     _partition,
     _export_date
-FROM MAUDE_DB.RAW.RAW_DEVICE_EVENT;
+FROM {{ db() }}.RAW.RAW_DEVICE_EVENT;
 
 -- ---------------------------------------------------------------------
 -- DIM_DEVICE - device-level detail incl. openFDA classification.
 -- ---------------------------------------------------------------------
 CREATE OR REPLACE DYNAMIC TABLE DIM_DEVICE
   TARGET_LAG = '1 day'
-  WAREHOUSE = MAUDE_WH
+  WAREHOUSE = {{ warehouse }}
   REFRESH_MODE = AUTO
   INITIALIZE = ON_CREATE
   COMMENT = 'Device grain: brand/manufacturer/model + openFDA classification'
@@ -84,7 +84,7 @@ SELECT
     dev.value:openfda:medical_specialty_description::string AS medical_specialty,
     dev.value:openfda:regulation_number::string        AS regulation_number,
     r._partition
-FROM MAUDE_DB.RAW.RAW_DEVICE_EVENT r,
+FROM {{ db() }}.RAW.RAW_DEVICE_EVENT r,
      LATERAL FLATTEN(input => r.payload:device) dev;
 
 -- ---------------------------------------------------------------------
@@ -94,20 +94,25 @@ FROM MAUDE_DB.RAW.RAW_DEVICE_EVENT r,
 -- ---------------------------------------------------------------------
 CREATE OR REPLACE DYNAMIC TABLE EVENT_NARRATIVE
   TARGET_LAG = '1 day'
-  WAREHOUSE = MAUDE_WH
+  WAREHOUSE = {{ warehouse }}
   REFRESH_MODE = AUTO
   INITIALIZE = ON_CREATE
   COMMENT = 'MDR narrative text (reporter + manufacturer), one row per segment'
 AS
 SELECT
     r.report_key                                       AS mdr_report_key,
+    -- FDA-assigned unique key for this narrative segment. Stable across
+    -- reloads/reindexes, so it is the citation id for Cortex Search.
+    -- Neither mdr_report_key nor (mdr_report_key, text_type_code) is unique
+    -- at this grain: an MDR can carry hundreds of narrative segments.
+    mt.value:mdr_text_key::string                      AS mdr_text_key,
     mt.value:text_type_code::string                    AS text_type_code,
     mt.value:text::string                              AS narrative_text,
     LENGTH(mt.value:text::string)                      AS narrative_length,
     (mt.value:text::string ILIKE '%(b)(4)%'
      OR mt.value:text::string ILIKE '%(b)(6)%')        AS redaction_flag,
     r._partition
-FROM MAUDE_DB.RAW.RAW_DEVICE_EVENT r,
+FROM {{ db() }}.RAW.RAW_DEVICE_EVENT r,
      LATERAL FLATTEN(input => r.payload:mdr_text) mt
 WHERE mt.value:text IS NOT NULL;
 
@@ -117,7 +122,7 @@ WHERE mt.value:text IS NOT NULL;
 -- ---------------------------------------------------------------------
 CREATE OR REPLACE DYNAMIC TABLE PATIENT_OUTCOME
   TARGET_LAG = '1 day'
-  WAREHOUSE = MAUDE_WH
+  WAREHOUSE = {{ warehouse }}
   REFRESH_MODE = AUTO
   INITIALIZE = ON_CREATE
   COMMENT = 'Patient grain: sex/age/weight and coded outcomes'
@@ -133,7 +138,7 @@ SELECT
     TO_JSON(pt.value:patient_problems)                 AS patient_problems,
     TO_JSON(pt.value:sequence_number_outcome)          AS outcome_codes,
     r._partition
-FROM MAUDE_DB.RAW.RAW_DEVICE_EVENT r,
+FROM {{ db() }}.RAW.RAW_DEVICE_EVENT r,
      LATERAL FLATTEN(input => r.payload:patient) pt;
 
 -- ---------------------------------------------------------------------
@@ -141,7 +146,7 @@ FROM MAUDE_DB.RAW.RAW_DEVICE_EVENT r,
 -- ---------------------------------------------------------------------
 CREATE OR REPLACE DYNAMIC TABLE BRIDGE_DEVICE_PROBLEM
   TARGET_LAG = '1 day'
-  WAREHOUSE = MAUDE_WH
+  WAREHOUSE = {{ warehouse }}
   REFRESH_MODE = AUTO
   INITIALIZE = ON_CREATE
   COMMENT = 'One row per (MDR, product problem description)'
@@ -150,6 +155,6 @@ SELECT
     r.report_key           AS mdr_report_key,
     pp.value::string        AS device_problem,
     r._partition
-FROM MAUDE_DB.RAW.RAW_DEVICE_EVENT r,
+FROM {{ db() }}.RAW.RAW_DEVICE_EVENT r,
      LATERAL FLATTEN(input => r.payload:product_problems) pp
 WHERE pp.value IS NOT NULL;

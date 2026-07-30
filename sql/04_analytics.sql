@@ -19,6 +19,7 @@ USE SCHEMA ANALYTICS;
 CREATE OR REPLACE VIEW V_NARRATIVE_ENRICHED AS
 SELECT
     n.mdr_report_key,
+    n.mdr_text_key,
     n.text_type_code,
     n.narrative_text,
     n.narrative_length,
@@ -151,7 +152,7 @@ CREATE OR REPLACE SEMANTIC VIEW MAUDE_DB.ANALYTICS.MAUDE_SAFETY_SV
 -- ---------------------------------------------------------------------
 CREATE OR REPLACE CORTEX SEARCH SERVICE MAUDE_DB.ANALYTICS.MAUDE_NARRATIVE_SEARCH
   ON narrative_text
-  ATTRIBUTES mdr_report_key, report_number, text_type_code, event_type, product_code,
+  ATTRIBUTES mdr_text_key, mdr_report_key, report_number, text_type_code, event_type, product_code,
              brand_name, medical_specialty, device_class, report_year, redaction_flag,
              citation_title, source_url
   WAREHOUSE = MAUDE_WH
@@ -159,6 +160,11 @@ CREATE OR REPLACE CORTEX SEARCH SERVICE MAUDE_DB.ANALYTICS.MAUDE_NARRATIVE_SEARC
   COMMENT = 'Semantic search over FDA MAUDE adverse-event narratives, cited by MDR key with FDA deep link'
   AS
   SELECT
+      -- Unique citation id. mdr_report_key is NOT unique at this grain (an MDR
+      -- carries many narrative segments), so using it would collapse or
+      -- mis-attribute citations. mdr_text_key is FDA-assigned per segment and
+      -- stable across reloads/reindexes.
+      n.mdr_text_key,
       n.mdr_report_key, n.narrative_text, n.text_type_code, n.redaction_flag,
       e.event_type, e.report_year, e.report_number,
       d.product_code, d.brand_name, d.medical_specialty, d.device_class,
@@ -177,39 +183,25 @@ CREATE OR REPLACE CORTEX SEARCH SERVICE MAUDE_DB.ANALYTICS.MAUDE_NARRATIVE_SEARC
   WHERE n.narrative_text IS NOT NULL AND n.narrative_length >= 20;
 
 -- ---------------------------------------------------------------------
--- AI enrichment (cost-bounded). Classifies the reporter narrative into a
--- clinical failure-mode + severity taxonomy. Materialized on a SAMPLE for
--- build validation; scale via the documented INSERT + serverless task,
--- gated by Cortex Code cost controls.
+-- AI enrichment target table (DDL only).
+--
+-- Deliberately NOT populated here. This script runs while the backfill is
+-- still loading, so any INSERT ... LIMIT n at this point would read a
+-- near-empty EVENT_NARRATIVE (the Dynamic Tables also carry TARGET_LAG,
+-- widening that window) and silently ship an empty table.
+-- Population happens in 08_enrichment.sql, after the backfill is verified.
+--
+-- Grain is one row per NARRATIVE SEGMENT (mdr_text_key), not per MDR: an
+-- MDR carries many segments, so an MDR-keyed table would not be unique.
 -- ---------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS AI_EVENT_ENRICHMENT (
-    mdr_report_key STRING,
-    failure_mode   STRING,
+    mdr_text_key    STRING,
+    mdr_report_key  STRING,
+    failure_mode    STRING,
     severity_bucket STRING,
-    enriched_at    TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+    enriched_at     TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
 )
-COMMENT = 'AI_CLASSIFY-derived failure mode + severity per MDR (cost-bounded)';
-
--- Build/validate on a bounded sample (safe to re-run for the demo).
-INSERT OVERWRITE INTO AI_EVENT_ENRICHMENT (mdr_report_key, failure_mode, severity_bucket)
-SELECT
-    mdr_report_key,
-    AI_CLASSIFY(narrative_text,
-        ['Device Malfunction','Use Error','Material or Component Failure',
-         'Software or Connectivity','Packaging or Sterility','Patient Injury',
-         'No Clear Failure']):labels[0]::string          AS failure_mode,
-    AI_CLASSIFY(narrative_text,
-        ['Death','Serious Injury','Malfunction Only','Unclear']):labels[0]::string AS severity_bucket
-FROM MAUDE_DB.ANALYTICS.V_NARRATIVE_ENRICHED
-WHERE text_type_code = 'Description of Event or Problem'
-  AND narrative_length BETWEEN 40 AND 4000
-LIMIT 200;
-
--- Scale-up pattern (run under a serverless task with a cost budget):
---   INSERT INTO AI_EVENT_ENRICHMENT ...
---   SELECT ... FROM V_NARRATIVE_ENRICHED v
---   WHERE v.text_type_code = 'Description of Event or Problem'
---     AND v.mdr_report_key NOT IN (SELECT mdr_report_key FROM AI_EVENT_ENRICHMENT);
+COMMENT = 'AI_CLASSIFY-derived failure mode + severity, one row per narrative segment (mdr_text_key). Populated by 08_enrichment.sql post-backfill; empty until then.';
 
 -- ---------------------------------------------------------------------
 -- Clinician read access to the gold objects.

@@ -5,206 +5,178 @@ description: Deploy the FDA MAUDE adverse-event pipeline + clinician Cortex Agen
 
 # Deploy FDA MAUDE Pipeline
 
-Deploys a Snowflake-native pipeline that ingests the full FDA MAUDE device adverse-event
-dataset, curates it into a star schema, and exposes it through Cortex Agents for device-safety
-intelligence. All data comes from the openFDA public API (CC0, no license/agreement needed).
+Deploys a Snowflake-native pipeline that ingests the FDA MAUDE device adverse-event
+dataset, curates it into a star schema, and exposes it through Cortex Agents for
+device-safety intelligence. All data comes from the openFDA public API (CC0, no
+license or data-sharing agreement needed).
+
+SQL is delivered as Jinja templates rendered against a per-deployment config, so the
+pipeline can target any database / warehouse / role names.
 
 ## Prerequisites
 
 - Active Snowflake connection
-- A role with CREATE DATABASE, CREATE WAREHOUSE, CREATE INTEGRATION privileges (typically SYSADMIN + ACCOUNTADMIN for the EAI)
-- The account must support External Access Integrations (standard in all commercial regions)
+- A role that can CREATE DATABASE / WAREHOUSE, plus ACCOUNTADMIN for the External
+  Access Integration and the account-level grants (EXECUTE MANAGED TASK, CORTEX_USER)
+- `uv` available locally (the renderer needs `jinja2` + `pyyaml`)
 
 ## Step 1: Configuration
 
 Ask the user for:
 
 1. **Target database** (default: `MAUDE_DB`)
-2. **Target warehouse** (default: `MAUDE_WH`, created as MEDIUM)
-3. **Role** with CREATE privileges (default: `SYSADMIN`)
+2. **Warehouse** (default: `MAUDE_WH`, created MEDIUM)
+3. **Engineer role** (default: `MAUDE_ENGINEER`) and **clinician role** (default: `MAUDE_CLINICIAN`)
 4. **Data scope** - how much history to load:
 
-| Scope | Records | Partitions | Backfill | Search index | Total wall-clock |
+| Scope (`load_scope`) | Records | Lanes | Backfill | Search index | Total |
 |---|---|---|---|---|---|
-| **Full history (1993-2026)** | ~25.4M | 362 | ~45 min | ~30 min | ~75 min |
-| **Last 10 years (2016+)** | ~16M | ~180 | ~20 min | ~15 min | ~35 min |
-| **Last 5 years (2021+)** | ~10M | ~100 | ~12 min | ~10 min | ~22 min |
+| `full` (1993-2026) | ~25.4M | 43 | ~45 min | ~30 min | ~75 min |
+| `last_10_years` (2016+) | ~16M | 34 | ~20 min | ~15 min | ~35 min |
+| `last_5_years` (2021+) | ~10M | 18 | ~12 min | ~10 min | ~22 min |
 
-All options use parallel fan-out (many XSMALL serverless task lanes). Backfill is idempotent
-and can be re-run if interrupted. Weekly incremental sync keeps data fresh regardless of scope.
+All scopes use the parallel fan-out (many XSMALL serverless lanes). Backfill is
+idempotent and safe to re-run. Weekly incremental sync keeps data fresh regardless
+of the initial scope.
 
-Present the table and ask the user to choose. Default to "Last 10 years" if unsure.
+Default to `last_10_years` if the user is unsure.
 
-## Step 2: Provision environment
+5. **AI enrichment sample size** (`enrichment_sample_rows`, default `200`).
+   `AI_CLASSIFY` bills per token, so the shipped enrichment is a bounded sample,
+   not the whole corpus. Raise it only if the user accepts the Cortex spend; the
+   scale-up task pattern is documented at the bottom of `08_enrichment.sql`.
 
-Execute `scripts/00_setup.sql` statements (adapt DB/warehouse/role names per Step 1 answers):
+## Step 2: Write the config and render the SQL
 
-- CREATE DATABASE, schemas RAW/CURATED/ANALYTICS
-- CREATE WAREHOUSE (MEDIUM, auto-suspend 60s)
-- CREATE ROLE MAUDE_ENGINEER + MAUDE_CLINICIAN with grants
-- CREATE NETWORK RULE + EXTERNAL ACCESS INTEGRATION (needs ACCOUNTADMIN)
-- GRANT EXECUTE MANAGED TASK ON ACCOUNT TO ROLE MAUDE_ENGINEER
+Write the answers to a config JSON (start from `assets/config.sample.json`):
 
-Then execute `scripts/01_raw.sql`:
-
-- CREATE STAGE, FILE FORMAT, RAW_DEVICE_EVENT table, LOAD_CONTROL, MANIFEST_HISTORY
-
-**Verify:** `SHOW SCHEMAS IN DATABASE <DB>` returns RAW, CURATED, ANALYTICS.
-
-## Step 3: Create ingest pipeline
-
-Execute `scripts/02_ingest.sql`:
-
-- CREATE PROCEDURE SP_MAUDE_INGEST (Snowpark Python, uses EAI + ijson for stream parsing)
-- CREATE TASK TASK_MAUDE_WEEKLY_SYNC (suspended)
-- CREATE TASK TASK_MAUDE_BACKFILL (one-off, for reference)
-
-**Verify:** `SHOW PROCEDURES LIKE 'SP_MAUDE_INGEST' IN SCHEMA <DB>.RAW` returns 1 row.
-
-## Step 4: Kick off parallel backfill
-
-Generate and execute the fan-out launcher. The DECLARE block creates XSMALL serverless task
-lanes, each calling SP_MAUDE_INGEST with a disjoint QUARTER_LIKE regex. Scope the bucket
-list based on the user's Step 1 choice:
-
-### Full history (1993-2026) — all buckets:
-```sql
-DECLARE
-  buckets ARRAY := ARRAY_CONSTRUCT(
-    '(1991|1992|1993|1994|1995|1996|1997|1998|1999|2000|2001|2002|2003|2004)q%',
-    '(2005|2006|2007|2008)q%',
-    '(2009|2010)q%',
-    '(2011|2012)q%',
-    '2013q%', '2014q%', '2015q%', '2016q%', '2017q%', '2018q%',
-    '2019q1%', '2019q2%', '2019q3%', '2019q4%',
-    '2020q1%', '2020q2%', '2020q3%', '2020q4%',
-    '2021q1%', '2021q2%', '2021q3%', '2021q4%',
-    '2022q1%', '2022q2%', '2022q3%', '2022q4%',
-    '2023q1%', '2023q2%', '2023q3%', '2023q4%',
-    '2024q1%', '2024q2%', '2024q3%', '2024q4%',
-    '2025q1%', '2025q2%', '2025q3%', '2025q4%',
-    '2026q1%', '2026q2%', '2026q3%', '2026q4%',
-    'all_other%'
-  );
+```json
+{
+  "target_database": "MAUDE_DB",
+  "warehouse": "MAUDE_WH",
+  "engineer_role": "MAUDE_ENGINEER",
+  "clinician_role": "MAUDE_CLINICIAN",
+  "eai_name": "MAUDE_OPENFDA_EAI",
+  "target_lag": "1 day",
+  "load_scope": "full",
+  "enrichment_sample_rows": 200,
+  "enrichment_min_corpus_rows": 100000
+}
 ```
 
-### Last 10 years (2016+):
-```sql
-DECLARE
-  buckets ARRAY := ARRAY_CONSTRUCT(
-    '(2016|2017|2018)q%',
-    '2019q1%', '2019q2%', '2019q3%', '2019q4%',
-    '2020q1%', '2020q2%', '2020q3%', '2020q4%',
-    '2021q1%', '2021q2%', '2021q3%', '2021q4%',
-    '2022q1%', '2022q2%', '2022q3%', '2022q4%',
-    '2023q1%', '2023q2%', '2023q3%', '2023q4%',
-    '2024q1%', '2024q2%', '2024q3%', '2024q4%',
-    '2025q1%', '2025q2%', '2025q3%', '2025q4%',
-    '2026q1%', '2026q2%', '2026q3%', '2026q4%',
-    'all_other%'
-  );
+Render every object:
+
+```bash
+uv run --with jinja2 --with pyyaml python assets/renderer/render.py \
+  --manifest assets/build_manifest.yaml \
+  --templates assets/templates \
+  --out ./rendered \
+  --config ./config.json
 ```
 
-### Last 5 years (2021+):
-```sql
-DECLARE
-  buckets ARRAY := ARRAY_CONSTRUCT(
-    '2021q1%', '2021q2%', '2021q3%', '2021q4%',
-    '2022q1%', '2022q2%', '2022q3%', '2022q4%',
-    '2023q1%', '2023q2%', '2023q3%', '2023q4%',
-    '2024q1%', '2024q2%', '2024q3%', '2024q4%',
-    '2025q1%', '2025q2%', '2025q3%', '2025q4%',
-    '2026q1%', '2026q2%', '2026q3%', '2026q4%',
-    'all_other%'
-  );
+The renderer is a pure text transform (no database access). It prints the resolved
+config and the list of rendered files. Verify the output contains no leftover
+default names if the user chose custom ones:
+
+```bash
+grep -l 'MAUDE_DB' ./rendered/*.sql   # expect no matches for a custom target_database
 ```
 
-After the buckets declaration, the loop body is identical for all scopes:
-```sql
-  i INT;
-  b STRING;
-BEGIN
-  FOR i IN 0 TO ARRAY_SIZE(buckets) - 1 DO
-    b := buckets[i]::string;
-    EXECUTE IMMEDIATE
-      'CREATE OR REPLACE TASK <DB>.RAW.TASK_MAUDE_BF_' || i ||
-      ' USER_TASK_MANAGED_INITIAL_WAREHOUSE_SIZE = ''XSMALL''' ||
-      ' USER_TASK_TIMEOUT_MS = 86400000' ||
-      ' SUSPEND_TASK_AFTER_NUM_FAILURES = 0' ||
-      ' AS CALL <DB>.RAW.SP_MAUDE_INGEST(''BACKFILL'', 0, ''' || b || ''')';
-    EXECUTE IMMEDIATE 'EXECUTE TASK <DB>.RAW.TASK_MAUDE_BF_' || i;
-  END FOR;
-  RETURN 'launched ' || ARRAY_SIZE(buckets) || ' backfill lanes';
-END;
-```
+## Step 3: Execute in manifest order
 
-Replace `<DB>` with the target database name from Step 1.
+Execute the rendered SQL in `build_manifest.yaml` `depends_on` order:
 
-**Monitor progress** (show this to the user):
+| Order | File | What it creates | Role needed |
+|---|---|---|---|
+| 1 | `00_setup.sql` | DB, schemas, warehouse, roles, EAI, task + CORTEX_USER grants | ACCOUNTADMIN |
+| 2 | `01_raw.sql` | Stage, file format, VARIANT landing table, control ledgers | engineer |
+| 3 | `02_ingest.sql` | `SP_MAUDE_INGEST` proc, weekly sync task, backfill task | engineer |
+| 4 | `07_backfill_fanout.sql` | Launches the parallel backfill lanes (async) | engineer |
+| 5 | `03_curated.sql` | Star schema Dynamic Tables | engineer |
+| 6 | `04_analytics.sql` | MDR-grain views, semantic view, Cortex Search, AI enrichment DDL | engineer |
+| 7 | `05_agents.sql` | Both Cortex Agents + clinician grants | engineer |
+| 8 | `06_profiling.sql` | Profiling queries + DMFs | engineer |
+
+Step 4 (the fan-out) runs **async**. Proceed to steps 5-8 while it loads.
+
+`08_enrichment.sql` is **not** in this list on purpose — it runs in Step 4 below,
+after the backfill is verified. Running it here would classify a near-empty
+`EVENT_NARRATIVE` and ship a dead table.
+
+**Monitor the backfill:**
 ```sql
 SELECT status, COUNT(*) AS partitions, SUM(loaded_records) AS rows_loaded
-FROM <DB>.RAW.LOAD_CONTROL GROUP BY status;
+FROM <TARGET_DB>.RAW.LOAD_CONTROL GROUP BY status;
 ```
 
-The backfill runs async. Proceed to Step 5 while it loads.
+## Step 4: Verify and finalize
 
-## Step 5: Build CURATED + ANALYTICS + Agents
+Once `LOAD_CONTROL` shows all partitions LOADED with 0 FAILED:
 
-Execute in order:
-1. `scripts/03_curated.sql` — Dynamic Tables (star schema, TARGET_LAG 1 day)
-2. `scripts/04_analytics.sql` — Semantic view, Cortex Search service, AI enrichment, grants
-3. `scripts/05_agents.sql` — Two Cortex Agents + clinician grants
-
-**Run these with `snow sql --enable-templating NONE`.** The default LEGACY
-templating parses the `&limit=1` in the FDA `source_url` expression in
-`04_analytics.sql` as a client-side variable and fails with
-`SQL template rendering error: 'limit' is undefined` before anything reaches
-Snowflake.
-
-**Re-running `04_analytics.sql` rebuilds the Cortex Search service** (it is
-`CREATE OR REPLACE`), which re-indexes every narrative from scratch. To change
-only the semantic view on an already-indexed deployment, run just the statements
-above the Cortex Search block instead of the whole file.
-
-DTs and Search service auto-populate as backfill data lands. No manual action needed.
-
-**Note:** The Cortex Search service indexes asynchronously after creation. It will show
-`serving_state: INITIALIZING` until the index build completes (~10-30 min depending on scope).
-
-## Step 6: Verify and finalize
-
-Once `LOAD_CONTROL` shows all partitions LOADED (0 FAILED):
-
-1. **Force-refresh Dynamic Tables** (or wait for the 1-day lag to settle):
+1. **Reconcile** the load against the openFDA manifest:
 ```sql
-ALTER DYNAMIC TABLE <DB>.CURATED.FACT_ADVERSE_EVENT REFRESH;
-ALTER DYNAMIC TABLE <DB>.CURATED.DIM_DEVICE REFRESH;
-ALTER DYNAMIC TABLE <DB>.CURATED.EVENT_NARRATIVE REFRESH;
-ALTER DYNAMIC TABLE <DB>.CURATED.PATIENT_OUTCOME REFRESH;
-ALTER DYNAMIC TABLE <DB>.CURATED.BRIDGE_DEVICE_PROBLEM REFRESH;
+SELECT
+  (SELECT COUNT(*) FROM <TARGET_DB>.RAW.RAW_DEVICE_EVENT) AS raw_rows,
+  (SELECT SUM(loaded_records) FROM <TARGET_DB>.RAW.LOAD_CONTROL WHERE status='LOADED') AS ledger_rows,
+  (SELECT MAX(total_records) FROM <TARGET_DB>.RAW.MANIFEST_HISTORY) AS manifest_total;
 ```
+For a `full` load these should match exactly. For a scoped load, `raw_rows` will be
+less than `manifest_total` by design.
 
-2. **Confirm search service is active:**
+2. **Refresh the Dynamic Tables** (or wait for the target lag):
 ```sql
-SHOW CORTEX SEARCH SERVICES LIKE 'MAUDE_NARRATIVE_SEARCH' IN SCHEMA <DB>.ANALYTICS;
--- serving_state should be ACTIVE
+ALTER DYNAMIC TABLE <TARGET_DB>.CURATED.FACT_ADVERSE_EVENT REFRESH;
+ALTER DYNAMIC TABLE <TARGET_DB>.CURATED.DIM_DEVICE REFRESH;
+ALTER DYNAMIC TABLE <TARGET_DB>.CURATED.EVENT_NARRATIVE REFRESH;
+ALTER DYNAMIC TABLE <TARGET_DB>.CURATED.PATIENT_OUTCOME REFRESH;
+ALTER DYNAMIC TABLE <TARGET_DB>.CURATED.BRIDGE_DEVICE_PROBLEM REFRESH;
 ```
 
-3. **Resume weekly sync:**
+3. **Confirm the search service is serving:**
 ```sql
-ALTER TASK <DB>.RAW.TASK_MAUDE_WEEKLY_SYNC RESUME;
+SHOW CORTEX SEARCH SERVICES LIKE 'MAUDE_NARRATIVE_SEARCH' IN SCHEMA <TARGET_DB>.ANALYTICS;
+-- serving_state must be ACTIVE (INITIALIZING means the index is still building)
+```
+If it stays `INITIALIZING` with `source_data_num_rows = 0` for over an hour, DROP and
+re-create the service - the initial index build can wedge.
+
+4. **Resume the weekly sync:**
+```sql
+ALTER TASK <TARGET_DB>.RAW.TASK_MAUDE_WEEKLY_SYNC RESUME;
 ```
 
-4. **Drop transient backfill lanes:**
+5. **Drop the transient backfill lanes:**
 ```sql
 DECLARE i INT; BEGIN FOR i IN 0 TO 50 DO
-  EXECUTE IMMEDIATE 'DROP TASK IF EXISTS <DB>.RAW.TASK_MAUDE_BF_'||i;
+  EXECUTE IMMEDIATE 'DROP TASK IF EXISTS <TARGET_DB>.RAW.TASK_MAUDE_BF_'||i;
 END FOR; END;
 ```
 
-5. **Test the agents:**
-- In Snowsight: AI & ML > Agents > MAUDE_DEVICE_SAFETY_AGENT > try a sample question.
-- Or via CoCo: `/cortex-agent` > chat > specify `<DB>.ANALYTICS.MAUDE_DEVICE_SAFETY_AGENT`.
+6. **Populate the AI enrichment** — now that the corpus is loaded, run the
+   deferred `08_enrichment.sql`. It self-guards: if `EVENT_NARRATIVE` is still
+   below `enrichment_min_corpus_rows` it fails fast rather than sampling an
+   empty table. Verify it landed:
+```sql
+SELECT COUNT(*) AS enriched_rows,
+       COUNT(DISTINCT mdr_text_key) AS distinct_segments
+FROM <TARGET_DB>.ANALYTICS.AI_EVENT_ENRICHMENT;
+-- enriched_rows should equal enrichment_sample_rows (default 200)
+-- and equal distinct_segments (grain is one row per narrative segment)
+```
+
+7. **Confirm citation IDs are unique** — agents cite on `MDR_TEXT_KEY`, the
+   FDA-assigned per-segment key. `mdr_report_key` is NOT unique in this corpus
+   (an MDR carries many narrative segments), so citing on it collapses or
+   mis-attributes results:
+```sql
+SELECT COUNT(*) AS rows_, COUNT(DISTINCT mdr_text_key) AS ids
+FROM <TARGET_DB>.CURATED.EVENT_NARRATIVE
+WHERE narrative_text IS NOT NULL AND narrative_length >= 20;
+-- rows_ must equal ids
+```
+
+8. **Test an agent** - in Snowsight (AI & ML > Agents) or via `/cortex-agent` chat
+   against `<TARGET_DB>.ANALYTICS.MAUDE_DEVICE_SAFETY_AGENT`.
 
 ## What gets deployed
 
@@ -212,38 +184,38 @@ END FOR; END;
 |---|---|---|
 | SP_MAUDE_INGEST | RAW | Snowpark ingest proc (backfill + sync) |
 | TASK_MAUDE_WEEKLY_SYNC | RAW | Weekly incremental (Mondays 6am PT) |
-| RAW_DEVICE_EVENT | RAW | VARIANT landing (1 row/MDR) |
-| LOAD_CONTROL | RAW | Per-partition load ledger |
+| RAW_DEVICE_EVENT | RAW | VARIANT landing, 1 row per MDR |
+| LOAD_CONTROL / MANIFEST_HISTORY | RAW | Per-partition ledger + manifest snapshots |
 | FACT_ADVERSE_EVENT | CURATED | Master event grain (DT) |
-| DIM_DEVICE | CURATED | Device + openFDA classification (DT) |
-| EVENT_NARRATIVE | CURATED | ~58M narrative segments + redaction flag (DT) |
-| PATIENT_OUTCOME | CURATED | Patient demographics + outcomes (DT) |
+| DIM_DEVICE / V_DEVICE_PRIMARY | CURATED | Device detail + MDR-grain view |
+| EVENT_NARRATIVE | CURATED | Narrative segments + `mdr_text_key` unique key + redaction flag (DT) |
+| PATIENT_OUTCOME / V_PATIENT_PRIMARY | CURATED | Patient outcomes + MDR-grain view |
 | BRIDGE_DEVICE_PROBLEM | CURATED | Product-problem codes (DT) |
 | MAUDE_SAFETY_SV | ANALYTICS | Semantic view (Cortex Analyst) |
-| MAUDE_NARRATIVE_SEARCH | ANALYTICS | Cortex Search (55M+ narratives, FDA citations) |
-| MAUDE_DEVICE_SAFETY_AGENT | ANALYTICS | Structured + unstructured + charts |
-| MAUDE_FAILURE_MODE_AGENT | ANALYTICS | Narrative RAG with cited MDRs |
+| MAUDE_NARRATIVE_SEARCH | ANALYTICS | Cortex Search, cited on `mdr_text_key` with FDA deep link |
+| AI_EVENT_ENRICHMENT | ANALYTICS | AI_CLASSIFY failure mode + severity, per narrative segment (populated in Step 4) |
+| MAUDE_DEVICE_SAFETY_AGENT | ANALYTICS | Analyst + Search + charts |
+| MAUDE_FAILURE_MODE_AGENT | ANALYTICS | Narrative RAG |
 
 ## Credits and cost
 
-- **Backfill (one-time):** many XSMALL serverless lanes for the duration shown in the scope table. Total credits ~2-5 depending on scope.
+- **Backfill (one-time):** many XSMALL serverless lanes for the duration in the scope table. Roughly 2-5 credits depending on scope.
 - **Weekly sync:** XS serverless, seconds of compute per run. Negligible.
-- **Dynamic Tables:** refresh on 1-day lag; minimal compute for incremental changes.
+- **Dynamic Tables:** refresh on the configured target lag; incremental where possible.
 - **Cortex Search:** serverless indexing, no warehouse credits.
-- **Agents:** per-query Cortex consumption (same as any Cortex Agent).
-- **Source data:** free. openFDA is public domain (CC0), no API key required for bulk downloads.
+- **Agents:** per-query Cortex consumption.
+- **Source data:** free. openFDA is public domain (CC0), no API key needed for bulk downloads.
 
 ## Governance
 
-Every agent response carries the FDA disclaimer: "MAUDE is a passive surveillance system.
-Report counts cannot establish event rates, incidence, or causation, and this information must
-not be used for individual patient-care decisions." Citations include `mdr_report_key`,
-`report_number`, and a clickable `source_url` to the official FDA MAUDE detail page.
+Every agent response carries the FDA disclaimer: "MAUDE is a passive surveillance
+system. Report counts cannot establish event rates, incidence, or causation, and this
+information must not be used for individual patient-care decisions." Citations are keyed
+on `mdr_text_key` (unique per narrative segment) and carry `mdr_report_key`,
+`report_number`, and a `source_url` pointing at the openFDA API record for independent
+verification.
 
 ## Reference docs (bundled)
 
-These companion files ship with this skill for deeper context. Read on demand when you need
-architecture detail, personas, or sample questions beyond what's in this workflow:
-
-- `references/overview.md` — project README: personas, use cases, sample questions (structured / unstructured / hybrid), architecture diagram, repo layout.
-- `references/architecture.md` — full design: dataset facts, source-path rationale, ingestion mechanics, parallel backfill (measured timings), star schema, agents, verification checklist.
+- `references/overview.md` — personas, use cases, sample questions (structured / unstructured / hybrid).
+- `references/architecture.md` — full design: dataset facts, ingestion mechanics, parallel backfill timings, star schema, verification checklist.
