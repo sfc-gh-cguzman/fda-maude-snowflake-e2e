@@ -94,6 +94,13 @@ GRANT USAGE ON INTEGRATION MAUDE_OPENFDA_EAI TO ROLE MAUDE_ENGINEER;
 GRANT EXECUTE MANAGED TASK ON ACCOUNT TO ROLE MAUDE_ENGINEER;
 GRANT EXECUTE TASK         ON ACCOUNT TO ROLE MAUDE_ENGINEER;
 
+-- Cortex AI usage (required for Cortex Search, Analyst, AI functions, Agents).
+-- Must run before 04_analytics.sql: without it CREATE CORTEX SEARCH SERVICE
+-- fails with "Unknown function 'SNOWFLAKE.CORTEX.EMBED_TEXT_768'", because the
+-- service compiles an internal Dynamic Table that calls the embedding function.
+GRANT DATABASE ROLE SNOWFLAKE.CORTEX_USER TO ROLE MAUDE_ENGINEER;
+GRANT DATABASE ROLE SNOWFLAKE.CORTEX_USER TO ROLE MAUDE_CLINICIAN;
+
 -- ---------------------------------------------------------------------
 -- Context for the rest of the build
 -- ---------------------------------------------------------------------

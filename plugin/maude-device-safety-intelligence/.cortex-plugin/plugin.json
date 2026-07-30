@@ -1,0 +1,13 @@
+{
+  "$schema": "https://industry-plugin-construct/schemas/plugin_manifest.schema.json",
+  "name": "maude-device-safety-intelligence",
+  "displayName": "MAUDE Device Safety Intelligence",
+  "description": "Deploy the FDA MAUDE adverse-event pipeline + clinician Cortex Agents in any Snowflake account. Full medallion (RAW/CURATED/ANALYTICS), parallel fan-out backfill, semantic view, Cortex Search over 58M narratives, two agents with FDA source-URL citations. Source: openFDA device/event (CC0, public domain, no license needed).",
+  "version": "0.1.0",
+  "author": { "name": "Snowflake HCLS Solutions", "email": "noreply@snowflake.com" },
+  "license": "Apache-2.0",
+  "keywords": ["hcls", "medical-devices", "fda", "maude", "adverse-events", "postmarket-surveillance", "cortex-agent", "cortex-search", "cortex-analyst", "device-safety"],
+  "skills": "./skills",
+  "agents": "./agents",
+  "generator_version": "industry-plugin-construct/composer@v2"
+}

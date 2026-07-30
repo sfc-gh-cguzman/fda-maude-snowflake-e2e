@@ -62,8 +62,10 @@ Key data models (`CURATED`):
 
 - `FACT_ADVERSE_EVENT` - one row per MDR (`mdr_report_key`): event type, dates, reporting lag, source.
 - `DIM_DEVICE` - device brand/manufacturer/model/product code + openFDA classification (device class, medical specialty, regulation number).
+- `V_DEVICE_PRIMARY` - one row per MDR (primary device), feeds the semantic view for dimension slicing without fanout.
 - `EVENT_NARRATIVE` - free-text reporter + manufacturer narratives, with `redaction_flag`.
 - `PATIENT_OUTCOME` - patient sex/age/weight and coded outcomes.
+- `V_PATIENT_PRIMARY` - one row per MDR (normalizes blank patient_sex), feeds the semantic view.
 - `BRIDGE_DEVICE_PROBLEM` - product-problem codes per report.
 
 ---
@@ -150,7 +152,7 @@ Each citation includes:
 - **`mdr_report_key`** - the FDA's canonical MDR identifier (join key across the whole schema).
 - **`report_number`** - the human-readable MDR number shown in the MAUDE web UI.
 - **`citation_title`** - composite label: `brand_name - event_type, year`.
-- **`source_url`** - clickable deep link to the public FDA MAUDE detail record (`https://www.accessdata.fda.gov/scripts/cdrh/cfdocs/cfMAUDE/detail.cfm?mdrfoi__id=<key>`), so RA/QA can verify the source directly.
+- **`source_url`** - clickable link to the openFDA API record for verification (`https://api.fda.gov/device/event.json?search=mdr_report_key:<key>&limit=1`). Uses the API instead of the cfMAUDE web page because the web detail page has coverage gaps for older records.
 
 ### Sample questions
 

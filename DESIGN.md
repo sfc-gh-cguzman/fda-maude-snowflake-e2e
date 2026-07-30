@@ -102,10 +102,12 @@ Incremental refresh, `TARGET_LAG='24 hours'`, grain reconstructed from the VARIA
 
 - **`FACT_ADVERSE_EVENT`** (grain = `mdr_report_key`): event_type, date_received, date_of_event, report_source_code, reporter_occupation, adverse_event_flag, product_problem_flag.
 - **`DIM_DEVICE`** (flatten `device[]`): brand_name, generic_name, manufacturer_d_name, model, product_code, `openfda.device_class`, `openfda.medical_specialty_description`, `openfda.regulation_number`.
+- **`V_DEVICE_PRIMARY`** (view over DIM_DEVICE): one row per MDR (lowest device_sequence_number). Feeds the semantic view so metrics can be sliced by brand/product_code/manufacturer without fanout.
 - **`EVENT_NARRATIVE`** (flatten `mdr_text[]`): mdr_report_key, text_type_code, `text` (clinical narrative) + `redaction_flag` derived from `(b)(4)`/`(b)(6)` presence.
-- **`PATIENT_OUTCOME`** (flatten `patient[]`) and **`BRIDGE_DEVICE_PROBLEM`** / **`BRIDGE_PATIENT_PROBLEM`** (problem codes).
+- **`PATIENT_OUTCOME`** (flatten `patient[]`) and **`BRIDGE_DEVICE_PROBLEM`** (problem codes).
+- **`V_PATIENT_PRIMARY`** (view over PATIENT_OUTCOME): one row per MDR (normalizes blank patient_sex to 'Unknown'). Feeds the semantic view.
 
-Enforce dedup on `mdr_report_key` (keep latest `_export_date`) to collapse supplemental report chains.
+The MDR-grain views (`V_DEVICE_PRIMARY`, `V_PATIENT_PRIMARY`) exist because a semantic view can only slice metrics by dimensions on the "one" side of a relationship. DIM_DEVICE is many-to-one with events (~17K reports name multiple devices); collapsing to primary device loses ~0.007% of distinct brand information.
 
 ### Step 6 - Data profiling
 Snowflake Notebook `01_maude_profiling.ipynb` + companion SQL producing:
@@ -120,9 +122,9 @@ Snowflake Notebook `01_maude_profiling.ipynb` + companion SQL producing:
 Attach DMFs (freshness, row_count, null_count, unique) on `FACT_ADVERSE_EVENT` for ongoing monitoring. Use `visualize_data` for the key distributions.
 
 ### Step 7 - ANALYTICS (Gold) layer
-- **Semantic view** over the star schema (facts: report counts by event_type/year; dims: device, manufacturer, product_code, medical_specialty, phase; verified queries for common safety questions) - powers Cortex Analyst.
-- **Cortex Search service** over `EVENT_NARRATIVE.text` (attributes: mdr_report_key, product_code, brand_name, event_type, date_received) with `TARGET_LAG` so new reports auto-index.
-- **AI enrichment** (incremental DT over new narratives to bound cost): `AI_CLASSIFY` for failure-mode / severity taxonomy, `AI_EXTRACT` for structured signals (component involved, use error vs device failure). Gate with Cortex Code cost controls.
+- **Semantic view** (`MAUDE_SAFETY_SV`) over the star schema using the MDR-grain views: events (CHILD) references devices/patients (PARENTS) so event metrics can be sliced by brand/product_code/manufacturer/specialty without fanout. Problems stays as a child of events with its own `affected_report_count` metric.
+- **Cortex Search service** (`MAUDE_NARRATIVE_SEARCH`) over narratives (attributes: mdr_report_key, report_number, product_code, brand_name, event_type, citation_title, source_url). Citations link to the openFDA API record (`api.fda.gov/device/event.json?search=mdr_report_key:<key>`). TARGET_LAG 1 day.
+- **AI enrichment** (cost-bounded): `AI_CLASSIFY` for failure-mode / severity taxonomy. Gate with Cortex Code cost controls.
 
 ### Step 8 - Clinician Cortex Agents
 Frame = device safety intelligence, not patient care. Build the top 2 first, then optionally 3-4.

@@ -37,7 +37,7 @@ Present the table and ask the user to choose. Default to "Last 10 years" if unsu
 
 ## Step 2: Provision environment
 
-Execute `sql/00_setup.sql` statements (adapt DB/warehouse/role names per Step 1 answers):
+Execute `scripts/00_setup.sql` statements (adapt DB/warehouse/role names per Step 1 answers):
 
 - CREATE DATABASE, schemas RAW/CURATED/ANALYTICS
 - CREATE WAREHOUSE (MEDIUM, auto-suspend 60s)
@@ -45,7 +45,7 @@ Execute `sql/00_setup.sql` statements (adapt DB/warehouse/role names per Step 1 
 - CREATE NETWORK RULE + EXTERNAL ACCESS INTEGRATION (needs ACCOUNTADMIN)
 - GRANT EXECUTE MANAGED TASK ON ACCOUNT TO ROLE MAUDE_ENGINEER
 
-Then execute `sql/01_raw.sql`:
+Then execute `scripts/01_raw.sql`:
 
 - CREATE STAGE, FILE FORMAT, RAW_DEVICE_EVENT table, LOAD_CONTROL, MANIFEST_HISTORY
 
@@ -53,7 +53,7 @@ Then execute `sql/01_raw.sql`:
 
 ## Step 3: Create ingest pipeline
 
-Execute `sql/02_ingest.sql`:
+Execute `scripts/02_ingest.sql`:
 
 - CREATE PROCEDURE SP_MAUDE_INGEST (Snowpark Python, uses EAI + ijson for stream parsing)
 - CREATE TASK TASK_MAUDE_WEEKLY_SYNC (suspended)
@@ -109,7 +109,8 @@ DECLARE
 ```sql
 DECLARE
   buckets ARRAY := ARRAY_CONSTRUCT(
-    '(2021|2022)q%',
+    '2021q1%', '2021q2%', '2021q3%', '2021q4%',
+    '2022q1%', '2022q2%', '2022q3%', '2022q4%',
     '2023q1%', '2023q2%', '2023q3%', '2023q4%',
     '2024q1%', '2024q2%', '2024q3%', '2024q4%',
     '2025q1%', '2025q2%', '2025q3%', '2025q4%',
@@ -150,9 +151,20 @@ The backfill runs async. Proceed to Step 5 while it loads.
 ## Step 5: Build CURATED + ANALYTICS + Agents
 
 Execute in order:
-1. `sql/03_curated.sql` — Dynamic Tables (star schema, TARGET_LAG 1 day)
-2. `sql/04_analytics.sql` — Semantic view, Cortex Search service, AI enrichment, grants
-3. `sql/05_agents.sql` — Two Cortex Agents + clinician grants
+1. `scripts/03_curated.sql` — Dynamic Tables (star schema, TARGET_LAG 1 day)
+2. `scripts/04_analytics.sql` — Semantic view, Cortex Search service, AI enrichment, grants
+3. `scripts/05_agents.sql` — Two Cortex Agents + clinician grants
+
+**Run these with `snow sql --enable-templating NONE`.** The default LEGACY
+templating parses the `&limit=1` in the FDA `source_url` expression in
+`04_analytics.sql` as a client-side variable and fails with
+`SQL template rendering error: 'limit' is undefined` before anything reaches
+Snowflake.
+
+**Re-running `04_analytics.sql` rebuilds the Cortex Search service** (it is
+`CREATE OR REPLACE`), which re-indexes every narrative from scratch. To change
+only the semantic view on an already-indexed deployment, run just the statements
+above the Cortex Search block instead of the whole file.
 
 DTs and Search service auto-populate as backfill data lands. No manual action needed.
 
@@ -233,5 +245,5 @@ not be used for individual patient-care decisions." Citations include `mdr_repor
 These companion files ship with this skill for deeper context. Read on demand when you need
 architecture detail, personas, or sample questions beyond what's in this workflow:
 
-- `docs/overview.md` — project README: personas, use cases, sample questions (structured / unstructured / hybrid), architecture diagram, repo layout.
-- `docs/architecture.md` — full design: dataset facts, source-path rationale, ingestion mechanics, parallel backfill (measured timings), star schema, agents, verification checklist.
+- `references/overview.md` — project README: personas, use cases, sample questions (structured / unstructured / hybrid), architecture diagram, repo layout.
+- `references/architecture.md` — full design: dataset facts, source-path rationale, ingestion mechanics, parallel backfill (measured timings), star schema, agents, verification checklist.

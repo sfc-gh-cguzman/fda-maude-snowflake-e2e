@@ -44,38 +44,90 @@ LEFT JOIN (
 ) d USING (mdr_report_key);
 
 -- ---------------------------------------------------------------------
+-- MDR-grain dimension views for the semantic model.
+--
+-- DIM_DEVICE and PATIENT_OUTCOME are landed at their source grain, which
+-- is *below* one-row-per-MDR (a report can name several devices). A
+-- semantic view can only slice a metric by dimensions on the "one" side
+-- of a relationship, so wiring DIM_DEVICE directly as a child of EVENTS
+-- makes brand / product code / manufacturer unusable with any event
+-- metric ("higher level of granularity than the base metric entity").
+--
+-- Measured on the 2021+ load (14,563,790 MDRs): 17,651 reports name more than
+-- one device row, but only 1,024 name more than one distinct brand and 412 more
+-- than one manufacturer - the rest are same-vendor component sets (pump +
+-- reservoir cassettes, sensor + reader). Real information loss from collapsing
+-- is therefore ~0.007%, and the top hidden secondary manufacturers are
+-- 'UNK'/'UNKNOWN' (177 of 412). PATIENT_OUTCOME is 1.0000 rows per MDR.
+--
+-- Known tradeoff, accepted deliberately: cross-vendor device *interaction* is
+-- invisible here (e.g. SoClean ozone cleaners co-reported with Philips
+-- Respironics CPAP units). Answer those with a direct query against
+-- CURATED.DIM_DEVICE, which retains every device row.
+-- ---------------------------------------------------------------------
+CREATE OR REPLACE VIEW MAUDE_DB.CURATED.V_DEVICE_PRIMARY
+COMMENT = 'Primary (lowest device_sequence_number) device per MDR - one row per report'
+AS
+SELECT mdr_report_key, brand_name, generic_name, device_manufacturer_name,
+       product_code, device_class, medical_specialty
+FROM MAUDE_DB.CURATED.DIM_DEVICE
+QUALIFY ROW_NUMBER() OVER (
+          PARTITION BY mdr_report_key
+          ORDER BY device_sequence_number, brand_name, product_code) = 1;
+
+-- patient_sex arrives with three distinct spellings of "unknown" ('Unknown',
+-- empty string, NULL). Collapsing the empty string keeps Cortex Analyst from
+-- reporting 1.4M events under a blank label as if it were its own cohort.
+CREATE OR REPLACE VIEW MAUDE_DB.CURATED.V_PATIENT_PRIMARY
+COMMENT = 'One patient-outcome row per MDR; blank patient_sex normalized to Unknown'
+AS
+SELECT mdr_report_key,
+       COALESCE(NULLIF(patient_sex, ''), 'Unknown') AS patient_sex
+FROM MAUDE_DB.CURATED.PATIENT_OUTCOME
+QUALIFY ROW_NUMBER() OVER (
+          PARTITION BY mdr_report_key
+          ORDER BY NULLIF(patient_sex, '') NULLS LAST) = 1;
+
+-- ---------------------------------------------------------------------
 -- Semantic view for Cortex Analyst (structured Q&A).
+--
+-- Relationship direction matters: EVENTS is the CHILD pointing up at the
+-- MDR-grain device / patient parents, so event metrics can be sliced by
+-- brand, product code, manufacturer, and specialty without fanout.
+-- PROBLEMS stays a child of EVENTS (2.19 rows per MDR - genuinely
+-- many-to-one) and therefore carries its own COUNT(DISTINCT) metric
+-- instead of borrowing the event-grain ones.
 -- ---------------------------------------------------------------------
 CREATE OR REPLACE SEMANTIC VIEW MAUDE_DB.ANALYTICS.MAUDE_SAFETY_SV
   TABLES (
     events   AS MAUDE_DB.CURATED.FACT_ADVERSE_EVENT PRIMARY KEY (mdr_report_key)
              COMMENT = 'One row per FDA medical device report (MDR)',
-    devices  AS MAUDE_DB.CURATED.DIM_DEVICE
-             COMMENT = 'Devices named on each report',
-    patients AS MAUDE_DB.CURATED.PATIENT_OUTCOME
-             COMMENT = 'Patient outcomes per report',
+    devices  AS MAUDE_DB.CURATED.V_DEVICE_PRIMARY PRIMARY KEY (mdr_report_key)
+             COMMENT = 'Primary device named on each report (one row per MDR)',
+    patients AS MAUDE_DB.CURATED.V_PATIENT_PRIMARY PRIMARY KEY (mdr_report_key)
+             COMMENT = 'Patient outcome per report (one row per MDR)',
     problems AS MAUDE_DB.CURATED.BRIDGE_DEVICE_PROBLEM
-             COMMENT = 'Product problem descriptions per report'
+             COMMENT = 'Product problem descriptions per report (many per MDR)'
   )
   RELATIONSHIPS (
-    dev_to_evt  AS devices  (mdr_report_key) REFERENCES events (mdr_report_key),
-    pat_to_evt  AS patients (mdr_report_key) REFERENCES events (mdr_report_key),
-    prob_to_evt AS problems (mdr_report_key) REFERENCES events (mdr_report_key)
+    evt_to_dev  AS events   (mdr_report_key) REFERENCES devices  (mdr_report_key),
+    evt_to_pat  AS events   (mdr_report_key) REFERENCES patients (mdr_report_key),
+    prob_to_evt AS problems (mdr_report_key) REFERENCES events   (mdr_report_key)
   )
   DIMENSIONS (
     events.event_type        AS event_type        COMMENT = 'Death | Injury | Malfunction | Other',
     events.report_year       AS report_year       COMMENT = 'Year FDA received the report',
     events.report_source_code AS report_source_code,
     events.reporter_occupation AS reporter_occupation_code,
-    events.manufacturer_name AS manufacturer_name,
     events.date_received     AS date_received,
-    devices.brand_name       AS brand_name,
+    devices.brand_name       AS brand_name        COMMENT = 'Device brand / trade name',
     devices.generic_name     AS generic_name,
     devices.product_code     AS product_code       COMMENT = 'FDA device product code',
     devices.device_class     AS device_class       COMMENT = 'FDA device class 1/2/3',
     devices.medical_specialty AS medical_specialty  COMMENT = 'FDA medical specialty panel',
-    devices.device_manufacturer_name AS device_manufacturer_name,
-    problems.device_problem  AS device_problem,
+    devices.manufacturer_name AS device_manufacturer_name
+             COMMENT = 'Device manufacturer as reported on the device record',
+    problems.device_problem  AS device_problem     COMMENT = 'FDA product problem description',
     patients.patient_sex     AS patient_sex
   )
   METRICS (
@@ -83,7 +135,11 @@ CREATE OR REPLACE SEMANTIC VIEW MAUDE_DB.ANALYTICS.MAUDE_SAFETY_SV
     events.death_count        AS COUNT(CASE WHEN events.event_type = 'Death' THEN 1 END) COMMENT = 'MDRs coded as Death',
     events.injury_count       AS COUNT(CASE WHEN events.event_type = 'Injury' THEN 1 END) COMMENT = 'MDRs coded as Injury',
     events.malfunction_count  AS COUNT(CASE WHEN events.event_type = 'Malfunction' THEN 1 END) COMMENT = 'MDRs coded as Malfunction',
-    events.avg_reporting_lag  AS AVG(events.reporting_lag_days) COMMENT = 'Avg days from event to FDA receipt'
+    events.avg_reporting_lag  AS AVG(CASE WHEN events.reporting_lag_days BETWEEN 0 AND 3650
+                                          THEN events.reporting_lag_days END)
+             COMMENT = 'Avg days from event to FDA receipt. Excludes impossible/implausible lags (raw data ranges -35396 to 45847 days) and the ~10% of MDRs with no event date. Distribution is right-skewed (median ~27d), so treat the mean as indicative only',
+    problems.affected_report_count AS COUNT(DISTINCT problems.mdr_report_key)
+             COMMENT = 'Distinct MDRs citing a given product problem (use with device_problem). Do NOT sum across device_problem values - an MDR citing several problems is counted in each group'
   )
   COMMENT = 'FDA MAUDE device adverse event semantic model. Postmarket surveillance only - not for individual patient care decisions; cannot establish rates or causation.';
 
